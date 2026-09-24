@@ -17,6 +17,8 @@ import {
 import { broadcast } from '../ws.js';
 import { listKnowledgeForCard } from '../knowledge.js';
 import { fanOutNotification } from '../notifications.js';
+import { transitionCard, WorkflowError } from '../workflow.js';
+import { hasTelegramWorkflowTopic, publishTelegramTaskProjection } from '../telegram/bot.js';
 
 const ATTACHMENTS_DIR = path.resolve(process.env.ATTACHMENTS_DIR ?? 'data/attachments');
 
@@ -71,6 +73,13 @@ export async function cardRoutes(app: FastifyInstance) {
       tags?: string[];
       due_date?: string | null;
       assignees?: string[];
+      owner_user_id?: string;
+      tester_user_id?: string | null;
+      work_type?: 'feature' | 'bug' | 'chore' | 'design';
+      priority?: 'P0' | 'P1' | 'P2' | 'P3';
+      acceptance_criteria?: string[];
+      branch_url?: string | null;
+      pull_request_url?: string | null;
       source?: 'manual' | 'telegram' | 'mirror';
       project?: string | null;
     };
@@ -78,27 +87,45 @@ export async function cardRoutes(app: FastifyInstance) {
     const {
       title,
       description = '',
-      status = 'backlog',
+      status = 'inbox',
       tags = [],
       due_date = null,
       assignees,
       source = 'manual',
       project = null,
+      owner_user_id,
+      tester_user_id = null,
+      work_type = 'chore',
+      priority = 'P2',
+      acceptance_criteria = [],
+      branch_url = null,
+      pull_request_url = null,
     } = req.body;
     if (!title || typeof title !== 'string' || !title.trim()) {
       return reply.code(400).send({ error: 'title required' });
     }
     if (!isStatus(status)) return reply.code(400).send({ error: 'invalid status' });
+    if (status !== 'inbox') return reply.code(400).send({ error: 'new tasks must start in Inbox' });
+    if (!['feature', 'bug', 'chore', 'design'].includes(work_type)) return reply.code(400).send({ error: 'invalid work_type' });
+    if (!['P0', 'P1', 'P2', 'P3'].includes(priority)) return reply.code(400).send({ error: 'invalid priority' });
+    if (!Array.isArray(acceptance_criteria) || acceptance_criteria.length > 3) return reply.code(400).send({ error: 'acceptance_criteria must contain at most 3 items' });
 
     const userId = req.user!.id;
-    const actualAssignees = assignees ?? [userId]; // default: assign to self
+    const ownerId = owner_user_id ?? assignees?.[0] ?? userId;
+    const actualAssignees = Array.from(new Set([...(assignees ?? []), ownerId]));
+    if (tester_user_id && tester_user_id === ownerId) return reply.code(400).send({ error: 'tester must differ from owner' });
 
     const { rows } = await pool.query<{ id: string }>(
-      `INSERT INTO cards (title, description, status, tags, due_date, source, created_by, project, position)
+      `INSERT INTO cards
+        (title, description, status, tags, due_date, source, created_by, project, position,
+         owner_user_id, tester_user_id, work_type, priority, acceptance_criteria, branch_url, pull_request_url)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
-         COALESCE((SELECT MIN(position) - 1 FROM cards WHERE status = $3 AND NOT archived), 0))
+         COALESCE((SELECT MIN(position) - 1 FROM cards WHERE status = $3 AND NOT archived), 0),
+         $9, $10, $11, $12, $13, $14, $15)
        RETURNING id`,
-      [title.trim(), description, status, tags, due_date, source, userId, project ? project.trim() : null],
+      [title.trim(), description, status, tags, due_date, source, userId, project ? project.trim() : null,
+        ownerId, tester_user_id, work_type, priority,
+        acceptance_criteria.map((x) => String(x).trim()).filter(Boolean), branch_url, pull_request_url],
     );
     const cardId = rows[0]!.id;
 
@@ -128,6 +155,14 @@ export async function cardRoutes(app: FastifyInstance) {
       shares: string[];
       needs_review: boolean;
       project: string | null;
+      owner_user_id: string;
+      tester_user_id: string | null;
+      work_type: 'feature' | 'bug' | 'chore' | 'design';
+      priority: 'P0' | 'P1' | 'P2' | 'P3';
+      acceptance_criteria: string[];
+      peer_test_notes: string;
+      branch_url: string | null;
+      pull_request_url: string | null;
     }>;
   }>('/api/cards/:id', { preHandler: requireUserOrApiToken }, async (req, reply) => {
     const { id } = req.params;
@@ -137,6 +172,11 @@ export async function cardRoutes(app: FastifyInstance) {
     if (!existing) return reply.code(404).send({ error: 'not found' });
     if (!(await canUserSeeCard(req.user!.id, id))) {
       return reply.code(404).send({ error: 'not found' });
+    }
+    const nextOwnerId = body.owner_user_id ?? existing.owner_user_id;
+    const nextTesterId = body.tester_user_id === undefined ? existing.tester_user_id : body.tester_user_id;
+    if (nextOwnerId && nextTesterId && nextOwnerId === nextTesterId) {
+      return reply.code(400).send({ error: 'tester must differ from owner' });
     }
 
     const sets: string[] = [];
@@ -150,12 +190,28 @@ export async function cardRoutes(app: FastifyInstance) {
     if (body.description !== undefined) push('description', body.description);
     if (body.status !== undefined) {
       if (!isStatus(body.status)) return reply.code(400).send({ error: 'invalid status' });
-      push('status', body.status);
     }
     if (body.tags !== undefined) push('tags', body.tags);
     if (body.due_date !== undefined) push('due_date', body.due_date);
-    if (body.position !== undefined) push('position', body.position);
+    if (body.position !== undefined && body.status === undefined) push('position', body.position);
     if (body.needs_review !== undefined) push('needs_review', body.needs_review);
+    if (body.owner_user_id !== undefined) push('owner_user_id', body.owner_user_id);
+    if (body.tester_user_id !== undefined) push('tester_user_id', body.tester_user_id);
+    if (body.work_type !== undefined) {
+      if (!['feature', 'bug', 'chore', 'design'].includes(body.work_type)) return reply.code(400).send({ error: 'invalid work_type' });
+      push('work_type', body.work_type);
+    }
+    if (body.priority !== undefined) {
+      if (!['P0', 'P1', 'P2', 'P3'].includes(body.priority)) return reply.code(400).send({ error: 'invalid priority' });
+      push('priority', body.priority);
+    }
+    if (body.acceptance_criteria !== undefined) {
+      if (!Array.isArray(body.acceptance_criteria) || body.acceptance_criteria.length > 3) return reply.code(400).send({ error: 'acceptance_criteria must contain at most 3 items' });
+      push('acceptance_criteria', body.acceptance_criteria.map((x) => String(x).trim()).filter(Boolean));
+    }
+    if (body.peer_test_notes !== undefined) push('peer_test_notes', body.peer_test_notes.slice(0, 2_000));
+    if (body.branch_url !== undefined) push('branch_url', body.branch_url);
+    if (body.pull_request_url !== undefined) push('pull_request_url', body.pull_request_url);
     if (body.project !== undefined) {
       push('project', body.project === null ? null : body.project.trim());
     }
@@ -175,6 +231,12 @@ export async function cardRoutes(app: FastifyInstance) {
         );
       }
     }
+    if (body.owner_user_id !== undefined) {
+      await pool.query(
+        `INSERT INTO card_assignees (card_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [id, body.owner_user_id],
+      );
+    }
     let newShareRecipients: string[] = [];
     if (body.shares !== undefined) {
       const { rows: prevShares } = await pool.query<{ user_id: string }>(
@@ -193,8 +255,22 @@ export async function cardRoutes(app: FastifyInstance) {
       }
     }
 
-    const updated = (await loadCard(id))!;
+    let updated: Card;
+    if (body.status !== undefined && body.status !== existing.status) {
+      if (!(await hasTelegramWorkflowTopic(body.status, existing.work_type))) {
+        return reply.code(409).send({ error: 'bind the target Telegram workflow topic before moving tasks there' });
+      }
+      try {
+        updated = await transitionCard(id, req.user!.id, body.status, body.position);
+      } catch (error) {
+        if (error instanceof WorkflowError) return reply.code(error.code === 'forbidden' ? 403 : 409).send({ error: error.message });
+        throw error;
+      }
+    } else {
+      updated = (await loadCard(id))!;
+    }
     await logActivity(req.user!.id, id, 'update', { changed: Object.keys(body) });
+    await publishTelegramTaskProjection(id);
 
     if (newShareRecipients.length > 0) {
       const actor = req.user!;

@@ -16,10 +16,12 @@ function relTime(iso: string): string {
 }
 
 const ACCENT: Record<string, string> = {
-  backlog:     'backlog',
-  today:       'today',
+  inbox:       'backlog',
   in_progress: 'doing',
-  done:        'done',
+  ready_for_test: 'today',
+  needs_fix: 'backlog',
+  ready_for_release: 'doing',
+  released: 'done',
 };
 
 type Props = {

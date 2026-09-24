@@ -4,7 +4,7 @@
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- ---------- enums ----------
-DO $$ BEGIN CREATE TYPE card_status AS ENUM ('backlog', 'today', 'in_progress', 'done');
+DO $$ BEGIN CREATE TYPE card_status AS ENUM ('inbox', 'in_progress', 'ready_for_test', 'needs_fix', 'ready_for_release', 'released');
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 DO $$ BEGIN CREATE TYPE card_source AS ENUM ('manual', 'telegram', 'mirror');
@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS cards (
   id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   title       TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
-  status      card_status NOT NULL DEFAULT 'backlog',
+  status      card_status NOT NULL DEFAULT 'inbox',
   tags        TEXT[] NOT NULL DEFAULT '{}',
   due_date    DATE,
   source      card_source NOT NULL DEFAULT 'manual',
@@ -85,7 +85,22 @@ ALTER TABLE cards ADD COLUMN IF NOT EXISTS needs_review BOOLEAN NOT NULL DEFAULT
 -- Phase 5+ tracks which Telegram message created each card, for reply-based commands.
 ALTER TABLE cards ADD COLUMN IF NOT EXISTS telegram_chat_id BIGINT;
 ALTER TABLE cards ADD COLUMN IF NOT EXISTS telegram_message_id BIGINT;
+ALTER TABLE cards ADD COLUMN IF NOT EXISTS owner_user_id UUID REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE cards ADD COLUMN IF NOT EXISTS tester_user_id UUID REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE cards ADD COLUMN IF NOT EXISTS work_type TEXT NOT NULL DEFAULT 'chore'
+  CHECK (work_type IN ('feature','bug','chore','design'));
+ALTER TABLE cards ADD COLUMN IF NOT EXISTS priority TEXT NOT NULL DEFAULT 'P2'
+  CHECK (priority IN ('P0','P1','P2','P3'));
+ALTER TABLE cards ADD COLUMN IF NOT EXISTS acceptance_criteria TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE cards ADD COLUMN IF NOT EXISTS peer_test_result TEXT NOT NULL DEFAULT 'not_started'
+  CHECK (peer_test_result IN ('not_started','passed','failed'));
+ALTER TABLE cards ADD COLUMN IF NOT EXISTS peer_test_notes TEXT NOT NULL DEFAULT '';
+ALTER TABLE cards ADD COLUMN IF NOT EXISTS branch_url TEXT;
+ALTER TABLE cards ADD COLUMN IF NOT EXISTS pull_request_url TEXT;
+ALTER TABLE cards ADD COLUMN IF NOT EXISTS release_id UUID;
 CREATE INDEX IF NOT EXISTS idx_cards_tg_msg ON cards(telegram_chat_id, telegram_message_id);
+CREATE INDEX IF NOT EXISTS idx_cards_owner ON cards(owner_user_id) WHERE NOT archived;
+CREATE INDEX IF NOT EXISTS idx_cards_tester ON cards(tester_user_id) WHERE NOT archived;
 
 CREATE INDEX IF NOT EXISTS idx_cards_status_position
   ON cards (status, position) WHERE NOT archived;
@@ -120,6 +135,80 @@ CREATE TABLE IF NOT EXISTS telegram_identities (
   telegram_username   TEXT,
   created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Explicitly remembered Telegram messages used as bounded, same-topic task context.
+CREATE TABLE IF NOT EXISTS telegram_context_messages (
+  chat_id         BIGINT NOT NULL,
+  thread_id       BIGINT NOT NULL DEFAULT 0,
+  message_id      BIGINT NOT NULL,
+  source_user_id  BIGINT NOT NULL,
+  remembered_by   UUID REFERENCES users(id) ON DELETE SET NULL,
+  body            TEXT NOT NULL,
+  note            TEXT NOT NULL DEFAULT '',
+  fts             TSVECTOR GENERATED ALWAYS AS (
+                    to_tsvector('simple', coalesce(body, '') || ' ' || coalesce(note, ''))
+                  ) STORED,
+  remembered_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  expires_at      TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (chat_id, thread_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS telegram_context_messages_fts_idx
+  ON telegram_context_messages USING GIN (fts);
+CREATE INDEX IF NOT EXISTS telegram_context_messages_expiry_idx
+  ON telegram_context_messages (expires_at);
+
+CREATE TABLE IF NOT EXISTS telegram_workflow_topics (
+  group_chat_id BIGINT NOT NULL,
+  route_key TEXT NOT NULL CHECK (route_key IN (
+    'inbox','in_progress','ready_for_test','needs_fix','ready_for_release','released','bugs'
+  )),
+  thread_id BIGINT NOT NULL,
+  bound_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (group_chat_id, route_key),
+  UNIQUE (group_chat_id, thread_id)
+);
+
+CREATE TABLE IF NOT EXISTS telegram_task_messages (
+  id BIGSERIAL PRIMARY KEY,
+  card_id UUID NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+  chat_id BIGINT NOT NULL,
+  thread_id BIGINT NOT NULL DEFAULT 0,
+  message_id BIGINT NOT NULL,
+  is_current BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (chat_id, thread_id, message_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS telegram_task_messages_current_idx
+  ON telegram_task_messages(card_id) WHERE is_current;
+
+CREATE TABLE IF NOT EXISTS telegram_projection_outbox (
+  card_id UUID PRIMARY KEY REFERENCES cards(id) ON DELETE CASCADE,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_error TEXT NOT NULL DEFAULT '',
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS workflow_releases (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  version TEXT NOT NULL UNIQUE,
+  commit_sha TEXT NOT NULL,
+  staging_result TEXT NOT NULL DEFAULT 'pending'
+    CHECK (staging_result IN ('pending','passed','failed')),
+  staging_notes TEXT NOT NULL DEFAULT '',
+  production_result TEXT NOT NULL DEFAULT 'pending'
+    CHECK (production_result IN ('pending','passed','failed')),
+  production_notes TEXT NOT NULL DEFAULT '',
+  deployed_at TIMESTAMPTZ,
+  created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+DO $$ BEGIN
+  ALTER TABLE cards ADD CONSTRAINT cards_release_id_fkey
+    FOREIGN KEY (release_id) REFERENCES workflow_releases(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- ---------- attachments ----------
 CREATE TABLE IF NOT EXISTS card_attachments (
@@ -166,7 +255,7 @@ CREATE TABLE IF NOT EXISTS card_templates (
   title            TEXT NOT NULL,
   description      TEXT NOT NULL DEFAULT '',
   tags             TEXT[] NOT NULL DEFAULT '{}',
-  status           card_status NOT NULL DEFAULT 'today',
+  status           card_status NOT NULL DEFAULT 'inbox',
   due_offset_days  INTEGER,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()

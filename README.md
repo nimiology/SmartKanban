@@ -41,8 +41,8 @@ seconds; sending a message to a bot is instant, and works from any phone.
 
 ### Interactive proposal flow (text messages)
 
-The bot runs your text through an LLM (gemini-2.0-flash-001 by default, via
-OpenRouter) and replies with a destination chooser:
+The bot runs your text through OpenAI (`gpt-4o-mini`) and replies with a
+destination chooser:
 
 ```
 📝 Buy eggs
@@ -53,11 +53,10 @@ Tags: #groceries
 [✏️ Edit] [❌ Cancel]
 ```
 
-- **🔒 Private / 👥 Public** — opens a column picker:
-  `[📥 Backlog] [📅 Today] [⚡ In Progress] [✅ Done]`
+- **🔒 Private / 👥 Public** — saves a new task to Inbox
 - **📚 Knowledge** — saves directly (URL auto-fetch if present, otherwise
   saved as a note)
-- **🔍 Check duplicates?** — runs Postgres FTS + Gemini Flash re-rank
+- **🔍 Check duplicates?** — runs Postgres FTS + OpenAI re-rank
   across your visible cards + knowledge and offers
   `[🔗 Link to existing] [+ Save anyway] [❌ Cancel]`
 - **✏️ Edit** — send replacement text; bot re-proposes
@@ -87,16 +86,49 @@ back to a new private card (knowledge attachments are web-only for now).
 The proposal message transforms into quick-action buttons:
 
 ```
-✓ Saved · 📅 Today — Buy eggs
+✓ Saved · 📥 Inbox — Buy eggs
 
-[⚡ Doing] [✅ Done] [🗑]
+[▶️ Start] [🗑]
 ```
 
-Tap to move the card across columns or archive it without leaving Telegram.
+Workflow buttons use the same server-side transition rules as the board. Tasks
+move through Inbox → In Progress → Ready for Test → Ready for Release →
+Released / Done, with Needs Fix returning to In Progress. The assigned tester
+must differ from the owner and records the pass/fail result.
+
+### Telegram project topics
+
+In the configured Telegram forum group, bind one topic per route by running the
+command from inside that topic as a workflow admin:
+
+```
+/topics bind inbox
+/topics bind in-progress
+/topics bind ready-for-test
+/topics bind needs-fix
+/topics bind ready-for-release
+/topics bind released
+/topics bind bugs
+/topics status
+```
+
+Reply to a teammate's message with `/task [instruction]` to capture it. The bot
+searches only explicitly remembered messages from that same topic, once, with
+bounded results; it does not crawl group history. New tasks are posted to Inbox,
+or Bugs / Triage when marked `#bug`. On each valid status change, the bot posts
+the current task card in the mapped topic and marks its previous post as moved.
+Failed projections stay in a durable retry queue and are retried automatically.
+Reply to a task card with `/start`, `/test`, `/approve`, or `/fail [notes]`.
+
+Release admins record the staging result with
+`/release <version> <commit-sha> <pass|fail> [notes]`, then the exact same
+version and commit SHA with `/done <version> <commit-sha> <pass|fail> [smoke notes]`.
+Only a passing staging result followed by a passing production smoke check marks
+linked release tasks as Released / Done. Deployments remain manual.
 
 ### Reply-based commands
 
-- `/today <message>` — skip proposal, save directly to Today
+- `/today <message>` — legacy shortcut; creates the task in Inbox
 - Reply to a bot card message with `/assign @alice` — reassign
 - Reply with `/share @alice @bob` — share
 
@@ -133,7 +165,7 @@ A lightweight inbox for URLs, snippets, and notes that link to cards.
 
 ### Web app
 
-- Drag-and-drop across four columns: Backlog / Today / In Progress / Done
+- Live six-state workflow board with validated drag-and-drop transitions
 - Three board scopes: **My board**, **Family Inbox**, **Everything**
 - Click a card → edit title, description, tags, due date, assignees,
   shares, linked knowledge
@@ -158,7 +190,7 @@ research pipeline:
   topics.
 - **Web search** — fresh results via [Tavily](https://tavily.com/)
   (free tier 1000/mo; set `TAVILY_API_KEY` in `server/.env`).
-- **LLM synthesis** — Gemini Flash composes a structured response:
+- **LLM synthesis** — OpenAI composes a structured response:
   summary + related items + web findings + suggested next steps.
 
 Results appear as a dedicated panel in the card edit dialog and a
@@ -200,6 +232,9 @@ Links are visible in:
 - Templates: private template events filtered server-side; only
   the owner receives `template.*` WS events for their private items
 - Knowledge: same filter — private items never broadcast outside owner
+- Telegram `/remember` saves only a message that a linked member explicitly
+  replies to; saved context is scoped to that chat/topic, expires after 30 days,
+  and `/task` searches only remembered messages from the source topic
 - Passwords hashed with Argon2id; sessions are `httpOnly sameSite=lax`
   cookies
 
@@ -221,13 +256,9 @@ Links are visible in:
 └──────────────────────────┼──────────────────────────────────┘
                            │
                 ┌──────────▼─────────┐           ┌──────────┐
-                │    Telegram API    │           │OpenRouter│
-                │ (polling/webhook)  │           │  primary │
-                └────────────────────┘           └────┬─────┘
-                                                      │fallback
-                                                 ┌────▼─────┐
-                                                 │  OpenAI  │
-                                                 │ +Whisper │
+                │    Telegram API    │           │ OpenAI   │
+                │ (polling/webhook)  │           │ chat +   │
+                └────────────────────┘           │ Whisper  │
                                                  └──────────┘
 ```
 
@@ -235,9 +266,8 @@ Links are visible in:
   [grammy](https://grammy.dev) for Telegram + [argon2](https://github.com/ranisalt/node-argon2)
   + JSDOM + Mozilla Readability for URL extraction
 - **Frontend:** React 18 + Vite + TypeScript + Tailwind + `@dnd-kit`
-- **AI:** **OpenRouter primary** (any model, `google/gemini-2.0-flash-001`
-  by default) with **OpenAI as fallback** — and OpenAI is the only
-  option for Whisper audio transcription. Embeddings via
+- **AI:** OpenAI (`gpt-4o-mini`) for chat, vision, and Whisper audio
+  transcription. Embeddings via
   `text-embedding-3-small` (optional, pgvector-backed).
 - **DB:** PostgreSQL 16, idempotent `schema.sql` (additive, safe to
   re-run). Optional `pgvector` extension for semantic search.
@@ -267,12 +297,8 @@ card.
 - Node 20+ (for local dev)
 - A Telegram bot ([@BotFather](https://t.me/BotFather)) — optional but
   the primary capture channel
-- An OpenRouter API key with a few dollars of credit (a $1 top-up lasts
-  months at family usage) — optional, but the proposal flow + vision
-  + summaries depend on it
-- *(Optional)* an OpenAI API key — needed only for voice transcription
-  (Whisper), embeddings, and as an automatic fallback if OpenRouter
-  rate-limits
+- An OpenAI API key — optional for the board, required for AI proposals,
+  vision summaries, weekly reviews, and voice transcription
 
 ### 2. Clone + install
 
@@ -298,9 +324,9 @@ Minimum required:
 
 ```
 COOKIE_SECRET=<any long random string>
+OPENAI_API_KEY=sk-…
 TELEGRAM_BOT_TOKEN=123456:ABCDEF…
 TELEGRAM_GROUP_ID=-100XXXXXXXXXX   # bot will silently ignore other groups
-OPENROUTER_API_KEY=sk-or-v1-…
 ```
 
 ### 4. Run
@@ -362,6 +388,13 @@ for your domain + Telegram + AI keys), schema init, build, optional
 Caddy auto-HTTPS, backups, and a printable onboarding snippet for the
 notetaker-kanban bridge.
 
+For existing installations, back up the database, apply
+`server/migrations/2026-09-23-telegram-context-messages.sql` and then
+`server/migrations/2026-09-23-workflow-v2.sql`, then restart the server.
+Configure `TELEGRAM_GROUP_ID`, create the seven forum topics, link member
+identities, and mark workflow admins in `users.is_admin` before using the
+Telegram workflow.
+
 Client side detects OS (macOS/Linux), checks deps (`git`, `curl`, `jq`),
 clones the bridge to `$HOME/.notetaker-kanban`, runs the bridge's own
 `install.sh`, prompts for KANBAN_URL + KANBAN_TOKEN, appends to your
@@ -420,11 +453,8 @@ See [`.env.example`](.env.example) for the full list. Highlights:
 | `TELEGRAM_GROUP_ID`          | The one family group id the bot answers in         | *(required if bot running)*     |
 | `TELEGRAM_WEBHOOK_URL`       | If set, use webhook; else long-poll                 | *(unset)*                       |
 | `TELEGRAM_WEBHOOK_SECRET`    | Webhook path secret                                 | `dev-webhook`                   |
-| `OPENROUTER_API_KEY`         | Primary AI (chat + vision)                          | *(optional)*                    |
-| `OPENROUTER_MODEL`           | Chat model                                          | `google/gemini-2.0-flash-001`   |
-| `OPENROUTER_VISION_MODEL`    | Vision model                                        | `google/gemini-2.0-flash-001`   |
-| `OPENAI_API_KEY`             | Whisper (audio) + AI fallback + embeddings          | *(optional)*                    |
-| `APP_URL`                    | Sent as `HTTP-Referer` to OpenRouter                | `http://localhost:8010`         |
+| `OPENAI_API_KEY`             | Chat, vision, Whisper, and optional embeddings      | *(optional)*                    |
+| `APP_URL`                    | Public app URL (secure cookies and public links)     | `http://localhost:8010`         |
 | `ATTACHMENTS_DIR`            | Local file storage                                  | `data/attachments`              |
 | `KNOWLEDGE_AUTOFETCH`        | Auto-fetch URLs on knowledge create                 | `true`                          |
 | `KNOWLEDGE_FETCH_TIMEOUT_MS` | URL fetch timeout                                   | `10000`                         |
@@ -629,7 +659,16 @@ Per-client visibility filter applies to all `template.*` and
 | (any text)       | DM / group | Run AI proposal flow                                        |
 | (voice/audio)    | DM / group | Whisper transcribe → card + audio attached                  |
 | (photo)          | DM / group | Vision summarize → card + image attached                    |
-| `/today <msg>`   | DM / group | Skip proposal; save directly to Today                       |
+| `/today <msg>`   | DM / group | Legacy shortcut; save directly to Inbox                     |
+| `/task`          | group reply | Create from replied-to message + bounded remembered context |
+| `/topics status` | group      | Show workflow topic bindings                                |
+| `/topics bind …` | topic      | Bind current forum topic to a workflow route (admin)        |
+| `/start`         | task reply | Inbox → In Progress (owner)                                 |
+| `/test`          | task reply | In Progress → Ready for Test (owner)                        |
+| `/approve`       | task reply | Pass peer test (assigned tester)                            |
+| `/fail [notes]`  | task reply | Fail peer test (assigned tester)                            |
+| `/release …`     | group      | Record staging result for a version + commit SHA (admin)    |
+| `/done …`        | group      | Record production smoke result and close release (admin)    |
 | `/assign @user`  | reply      | Reassign card                                               |
 | `/share @a @b`   | reply      | Add sharers                                                 |
 | `/use <name>`    | DM only    | Instantiate template                                        |
@@ -639,6 +678,9 @@ Per-client visibility filter applies to all `template.*` and
 | `/note`          | DM         | Create knowledge item (title on first line, body after)     |
 | `/k <query>`     | DM         | Search knowledge items                                      |
 | `/klist`         | DM         | List your knowledge items                                   |
+| `/remember [note]` | reply in group | Save the replied-to text as same-topic task context for 30 days |
+| `/forget`          | reply in group | Remove remembered context (original author or saver only)      |
+| `/task <prompt>`   | reply in group | Propose a task using the replied-to message and remembered context in that topic |
 
 `/use`, `/t`, `/templates` in group chats are silently ignored to
 prevent the command body from being parsed as a card seed.
@@ -682,7 +724,7 @@ SmartKanban/
 │   │   ├── routes/                 # auth, cards, templates, knowledge,
 │   │   │                           #   mirror, review, telegram, attachments
 │   │   ├── ai/
-│   │   │   ├── openai.ts           # OpenRouter primary + OpenAI fallback
+│   │   │   ├── openai.ts           # OpenAI chat, vision, and audio client
 │   │   │   ├── propose.ts          # text → card proposal
 │   │   │   ├── vision.ts           # photo → card via vision model
 │   │   │   ├── whisper.ts          # audio → text (OpenAI only)
@@ -748,7 +790,8 @@ event flow exercises most paths.
   is fine)
 - **Not** mobile-native — responsive web + PWA install is the support
   model
-- **Not** a chat app — Telegram is capture-only, not discussion threads
+- Telegram discussions stay in Telegram; SmartKanban manages task state and
+  projects current task cards into configured forum topics
 
 Plus these explicit v1 omissions: color priorities, subtasks/checklists,
 card comments, multi-group Telegram, per-user custom column layouts,
@@ -763,7 +806,7 @@ post-brief features:
 
 | Phase | Scope                                                          | Status |
 | :---: | -------------------------------------------------------------- | :----: |
-| 1     | Single-user CRUD, 4 columns, drag-drop, Postgres               |   ✅   |
+| 1     | Single-user CRUD, live workflow board, Postgres                 |   ✅   |
 | 2     | Auth, users, Family Inbox, sharing, WebSocket sync             |   ✅   |
 | 2.5   | Telegram text + voice → Whisper → card, attachments            |   ✅   |
 | 3     | `/my-day` mirror view, long-lived mirror tokens                |   ✅   |

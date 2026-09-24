@@ -6,24 +6,30 @@ import { CardView } from './CardView.tsx';
 import type { Status } from '../types.ts';
 
 const LANE_ACCENT: Record<string, string> = {
-  backlog:     'backlog',
-  today:       'today',
+  inbox:       'backlog',
   in_progress: 'doing',
-  done:        'done',
+  ready_for_test: 'today',
+  needs_fix: 'backlog',
+  ready_for_release: 'doing',
+  released: 'done',
 };
 
 const LANE_LABEL: Record<string, string> = {
-  backlog:     'Backlog',
-  today:       'Today',
+  inbox:       'Inbox',
   in_progress: 'In Progress',
-  done:        'Done',
+  ready_for_test: 'Ready for Test',
+  needs_fix: 'Needs Fix',
+  ready_for_release: 'Ready for Release',
+  released: 'Released / Done',
 };
 
 const EMPTY_MSG: Record<string, string> = {
-  backlog:     'Nothing here yet.',
-  today:       'Nothing planned for today.',
+  inbox:       'Nothing waiting for triage.',
   in_progress: 'Quiet here.',
-  done:        'Nothing finished yet.',
+  ready_for_test: 'Nothing waiting for peer test.',
+  needs_fix: 'No failed tests.',
+  ready_for_release: 'Nothing staged for release.',
+  released: 'Nothing released yet.',
 };
 
 type Props = {
@@ -59,14 +65,16 @@ export function Column({ status, cards, users, unreadCounts, onCreate, onEdit }:
           <span className="lane-title">{LANE_LABEL[status]}</span>
           <span className="lane-count">{String(cards.length).padStart(2, '0')}</span>
         </div>
-        <button
-          className="lane-add"
-          onClick={() => onCreate(status)}
-          title="Add card"
-          aria-label="Add card"
-        >
-          +
-        </button>
+        {status === 'inbox' && (
+          <button
+            className="lane-add"
+            onClick={() => onCreate('inbox')}
+            title="Add task to Inbox"
+            aria-label="Add task to Inbox"
+          >
+            +
+          </button>
+        )}
       </div>
 
       {/* Cards */}

@@ -2,10 +2,12 @@ import type { Card, Status } from '../types.ts';
 import { STATUSES, STATUS_LABELS } from '../types.ts';
 
 const STATUS_EMOJI: Record<Status, string> = {
-  backlog: '📥',
-  today: '📅',
+  inbox: '📥',
   in_progress: '⚡',
-  done: '✅',
+  ready_for_test: '🧪',
+  needs_fix: '🛠️',
+  ready_for_release: '🚀',
+  released: '✅',
 };
 
 type Props = {

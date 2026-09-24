@@ -51,10 +51,10 @@ export function useKeyboardShortcuts({
         return;
       }
 
-      // 'n': trigger add card in backlog column
+      // 'n': capture a task in the workflow Inbox
       if (e.key === 'n') {
         e.preventDefault();
-        window.dispatchEvent(new CustomEvent('kanban:add-card', { detail: { status: 'backlog' } }));
+        window.dispatchEvent(new CustomEvent('kanban:add-card', { detail: { status: 'inbox' } }));
         return;
       }
 

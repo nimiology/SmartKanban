@@ -1,11 +1,20 @@
-export const STATUSES = ['backlog', 'today', 'in_progress', 'done'] as const;
+export const STATUSES = [
+  'inbox',
+  'in_progress',
+  'ready_for_test',
+  'needs_fix',
+  'ready_for_release',
+  'released',
+] as const;
 export type Status = (typeof STATUSES)[number];
 
 export const STATUS_LABELS: Record<Status, string> = {
-  backlog: 'Backlog',
-  today: 'Today',
+  inbox: 'Inbox',
   in_progress: 'In Progress',
-  done: 'Done',
+  ready_for_test: 'Ready for Test',
+  needs_fix: 'Needs Fix',
+  ready_for_release: 'Ready for Release',
+  released: 'Released / Done',
 };
 
 export type Source = 'manual' | 'telegram' | 'mirror';
@@ -33,6 +42,17 @@ export type Card = {
   created_by: string | null;
   ai_summarized: boolean;
   needs_review: boolean;
+  project: string | null;
+  owner_user_id: string | null;
+  tester_user_id: string | null;
+  work_type: 'feature' | 'bug' | 'chore' | 'design';
+  priority: 'P0' | 'P1' | 'P2' | 'P3';
+  acceptance_criteria: string[];
+  peer_test_result: 'not_started' | 'passed' | 'failed';
+  peer_test_notes: string;
+  branch_url: string | null;
+  pull_request_url: string | null;
+  release_id: string | null;
   assignees: string[];
   shares: string[];
   attachments: Attachment[];

@@ -25,6 +25,13 @@ export function EditDialog({ card, users, meId, incomingChatEvents, onSave, onCl
   const [description, setDescription] = useState(card.description);
   const [tags, setTags] = useState(card.tags.join(', '));
   const [assignees, setAssignees] = useState<string[]>(card.assignees);
+  const [ownerId, setOwnerId] = useState(card.owner_user_id ?? meId);
+  const [testerId, setTesterId] = useState(card.tester_user_id ?? '');
+  const [workType, setWorkType] = useState<Card['work_type']>(card.work_type);
+  const [priority, setPriority] = useState<Card['priority']>(card.priority);
+  const [acceptanceCriteria, setAcceptanceCriteria] = useState(card.acceptance_criteria.join('\n'));
+  const [branchUrl, setBranchUrl] = useState(card.branch_url ?? '');
+  const [pullRequestUrl, setPullRequestUrl] = useState(card.pull_request_url ?? '');
   const [shares, setShares] = useState<string[]>(card.shares);
   const [dueDate, setDueDate] = useState(card.due_date ?? '');
 
@@ -124,6 +131,13 @@ export function EditDialog({ card, users, meId, incomingChatEvents, onSave, onCl
         .map((t) => t.trim().replace(/^#/, ''))
         .filter(Boolean),
       assignees,
+      owner_user_id: ownerId,
+      tester_user_id: testerId || null,
+      work_type: workType,
+      priority,
+      acceptance_criteria: acceptanceCriteria.split('\n').map((x) => x.trim()).filter(Boolean).slice(0, 3),
+      branch_url: branchUrl.trim() || null,
+      pull_request_url: pullRequestUrl.trim() || null,
       shares,
       due_date: dueDate || null,
       needs_review: false,
@@ -437,6 +451,42 @@ export function EditDialog({ card, users, meId, incomingChatEvents, onSave, onCl
               )}
             </div>
           )}
+
+          <div className="rounded-xl border border-ink/10 bg-card/60 p-3 mb-4">
+            <div className="text-1 tracking-tight2 text-ink-soft mb-2">Workflow</div>
+            <div className="grid grid-cols-2 gap-3">
+              <label className="text-1 text-ink-soft">Owner
+                <select className="mt-1 w-full rounded-lg border border-ink/10 bg-card px-2 py-2 text-2 text-ink" value={ownerId} onChange={(e) => setOwnerId(e.target.value)}>
+                  {users.map((u) => <option key={u.id} value={u.id}>{u.short_name || u.name}</option>)}
+                </select>
+              </label>
+              <label className="text-1 text-ink-soft">Peer tester
+                <select className="mt-1 w-full rounded-lg border border-ink/10 bg-card px-2 py-2 text-2 text-ink" value={testerId} onChange={(e) => setTesterId(e.target.value)}>
+                  <option value="">Choose a different teammate</option>
+                  {users.filter((u) => u.id !== ownerId).map((u) => <option key={u.id} value={u.id}>{u.short_name || u.name}</option>)}
+                </select>
+              </label>
+              <label className="text-1 text-ink-soft">Type
+                <select className="mt-1 w-full rounded-lg border border-ink/10 bg-card px-2 py-2 text-2 text-ink" value={workType} onChange={(e) => setWorkType(e.target.value as Card['work_type'])}>
+                  <option value="feature">Feature</option><option value="bug">Bug</option><option value="chore">Chore</option><option value="design">Design</option>
+                </select>
+              </label>
+              <label className="text-1 text-ink-soft">Priority
+                <select className="mt-1 w-full rounded-lg border border-ink/10 bg-card px-2 py-2 text-2 text-ink" value={priority} onChange={(e) => setPriority(e.target.value as Card['priority'])}>
+                  <option>P0</option><option>P1</option><option>P2</option><option>P3</option>
+                </select>
+              </label>
+              <label className="col-span-2 text-1 text-ink-soft">Acceptance criteria (up to 3, one per line)
+                <textarea className="mt-1 w-full rounded-lg border border-ink/10 bg-card px-2 py-2 text-2 text-ink" rows={3} value={acceptanceCriteria} onChange={(e) => setAcceptanceCriteria(e.target.value)} />
+              </label>
+              <label className="text-1 text-ink-soft">Branch URL
+                <input className="mt-1 w-full rounded-lg border border-ink/10 bg-card px-2 py-2 text-2 text-ink" value={branchUrl} onChange={(e) => setBranchUrl(e.target.value)} />
+              </label>
+              <label className="text-1 text-ink-soft">Pull request URL
+                <input className="mt-1 w-full rounded-lg border border-ink/10 bg-card px-2 py-2 text-2 text-ink" value={pullRequestUrl} onChange={(e) => setPullRequestUrl(e.target.value)} />
+              </label>
+            </div>
+          </div>
 
           <div className="grid grid-cols-2 gap-4">
             <div>

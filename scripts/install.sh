@@ -952,13 +952,8 @@ do_install() {
       fi
     fi
 
-    OPENROUTER_API_KEY=""
-    if ask_yn "Configure OpenRouter (AI proposal flow, vision, weekly summary)?" "y"; then
-      OPENROUTER_API_KEY="$(ask "OpenRouter API key (sk-or-v1-…) or leave blank to skip" "")"
-    fi
-
     OPENAI_API_KEY=""
-    if ask_yn "Configure OpenAI (Whisper voice transcription + AI fallback)?" "n"; then
+    if ask_yn "Configure OpenAI (chat, vision, and voice transcription)?" "y"; then
       OPENAI_API_KEY="$(ask "OpenAI API key (sk-…) or leave blank to skip" "")"
     fi
 
@@ -979,10 +974,6 @@ TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
 TELEGRAM_GROUP_ID=$TELEGRAM_GROUP_ID
 TELEGRAM_WEBHOOK_URL=$TELEGRAM_WEBHOOK_URL
 TELEGRAM_WEBHOOK_SECRET=$TELEGRAM_WEBHOOK_SECRET
-
-OPENROUTER_API_KEY=$OPENROUTER_API_KEY
-OPENROUTER_MODEL=google/gemini-2.0-flash-001
-OPENROUTER_VISION_MODEL=google/gemini-2.0-flash-001
 
 OPENAI_API_KEY=$OPENAI_API_KEY
 

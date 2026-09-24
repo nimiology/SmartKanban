@@ -1,12 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import type { Status } from '../types.ts';
-import { STATUSES, STATUS_LABELS } from '../types.ts';
+import { STATUS_LABELS } from '../types.ts';
 import { useTemplates } from '../hooks/useTemplates.ts';
 
 type Props = {
-  initialStatus?: Status;
-  counts?: Record<Status, number>;
   onCreate: (title: string, status: Status) => Promise<void> | void;
   onCreateFromImage: (file: File, status: Status) => Promise<void> | void;
   onInstantiateTemplate: (id: string, status: Status) => Promise<void> | void;
@@ -15,15 +13,15 @@ type Props = {
 };
 
 const LANE_DOT: Record<Status, string> = {
-  backlog:     'rgb(var(--pin-backlog))',
-  today:       'rgb(var(--pin-today))',
+  inbox:       'rgb(var(--pin-backlog))',
   in_progress: 'rgb(var(--pin-doing))',
-  done:        'rgb(var(--pin-done))',
+  ready_for_test: 'rgb(var(--pin-today))',
+  needs_fix: 'rgb(var(--pin-backlog))',
+  ready_for_release: 'rgb(var(--pin-doing))',
+  released: 'rgb(var(--pin-done))',
 };
 
 export function CaptureBar({
-  initialStatus = 'today',
-  counts,
   onCreate,
   onCreateFromImage,
   onInstantiateTemplate,
@@ -31,14 +29,12 @@ export function CaptureBar({
   autoFocus,
 }: Props) {
   const [draft, setDraft] = useState('');
-  const [target, setTarget] = useState<Status>(initialStatus);
-  const [lanePickerOpen, setLanePickerOpen] = useState(false);
+  const target: Status = 'inbox';
   const [templatePickerOpen, setTemplatePickerOpen] = useState(false);
   const photoInputRef = useRef<HTMLInputElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const { templates } = useTemplates();
 
-  useEffect(() => { setTarget(initialStatus); }, [initialStatus]);
   useEffect(() => { if (autoFocus) inputRef.current?.focus(); }, [autoFocus]);
 
   const submit = async () => {
@@ -81,25 +77,19 @@ export function CaptureBar({
 
       {/* Target chip + draft + send */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-        <button
-          type="button"
-          onClick={() => setLanePickerOpen(true)}
-          aria-label="Pick target lane"
-          style={{
-            flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: 6,
-            background: 'rgb(var(--hairline) / 0.06)', border: '1px solid rgb(var(--hairline) / 0.12)',
-            borderRadius: 999, padding: '4px 10px 4px 6px',
-            fontSize: 12, fontWeight: 500, color: 'rgb(var(--ink-2))', cursor: 'pointer',
-            fontFamily: 'Inter, sans-serif',
-          }}
-        >
+        <span style={{
+          flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: 6,
+          background: 'rgb(var(--hairline) / 0.06)', border: '1px solid rgb(var(--hairline) / 0.12)',
+          borderRadius: 999, padding: '4px 10px 4px 6px',
+          fontSize: 12, fontWeight: 500, color: 'rgb(var(--ink-2))',
+          fontFamily: 'Inter, sans-serif',
+        }}>
           <span style={{
             display: 'inline-block', width: 10, height: 10, borderRadius: 999,
             background: LANE_DOT[target],
           }} />
           <span>{STATUS_LABELS[target]}</span>
-          <span aria-hidden style={{ fontSize: 9, opacity: 0.6 }}>▾</span>
-        </button>
+        </span>
         <input
           ref={inputRef}
           value={draft}
@@ -162,32 +152,6 @@ export function CaptureBar({
         </Sheet>
       )}
 
-      {/* Lane picker */}
-      {lanePickerOpen && (
-        <Sheet onClose={() => setLanePickerOpen(false)} title="Save next card to…">
-          {STATUSES.map((s) => {
-            const active = target === s;
-            return (
-              <SheetRow
-                key={s}
-                active={active}
-                onClick={() => { setTarget(s); setLanePickerOpen(false); }}
-              >
-                <span style={{
-                  display: 'inline-block', width: 14, height: 14, borderRadius: 999,
-                  background: LANE_DOT[s], marginRight: 12,
-                }} />
-                <span style={{ flex: 1, fontWeight: active ? 600 : 500 }}>{STATUS_LABELS[s]}</span>
-                {counts && (
-                  <span style={{ fontSize: 13, color: 'rgb(var(--ink-3))', fontFamily: 'JetBrains Mono, monospace' }}>
-                    {counts[s]}
-                  </span>
-                )}
-              </SheetRow>
-            );
-          })}
-        </Sheet>
-      )}
     </div>
   );
 }

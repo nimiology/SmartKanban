@@ -5,10 +5,12 @@ import type { Card, User } from '../types.ts';
 import { getCachedLatest } from '../hooks/useInsights.ts';
 
 const STATUS_ACCENT: Record<string, string> = {
-  backlog:     'backlog',
-  today:       'today',
+  inbox:       'backlog',
   in_progress: 'doing',
-  done:        'done',
+  ready_for_test: 'today',
+  needs_fix: 'backlog',
+  ready_for_release: 'doing',
+  released: 'done',
 };
 
 function stableHash(s: string): number {
@@ -111,6 +113,15 @@ export function CardView({ card, users = [], unreadCount = 0, onClick, dragging,
           <div className="note-title" style={{ fontSize: compact ? 13 : 15, marginBottom: 8 }}>
             {card.title}
           </div>
+
+          {!compact && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8, fontSize: 10.5, color: 'rgb(var(--ink-3))' }}>
+              <span>{card.work_type}</span>
+              <span>{card.priority}</span>
+              {card.owner_user_id && <span>Owner: {users.find((u) => u.id === card.owner_user_id)?.short_name ?? 'Unknown'}</span>}
+              {card.peer_test_result === 'passed' && <span>✓ peer tested</span>}
+            </div>
+          )}
 
           {/* Description (non-compact only) */}
           {!compact && card.description && (

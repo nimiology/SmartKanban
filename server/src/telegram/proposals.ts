@@ -40,6 +40,11 @@ export type PendingProposal = {
   pendingLinkTargetId?: string;
   pendingLinkLabel?: CardLinkLabel;
   awaitingLinkNote?: boolean;
+  contextSnippets?: string[];
+  contextMessageIds?: number[];
+  taskSourceMessageId?: number;
+  taskSourceThreadId?: number;
+  taskWorkType?: 'feature' | 'bug' | 'chore' | 'design';
 };
 
 const TTL_MS = 15 * 60 * 1000;

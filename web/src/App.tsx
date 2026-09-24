@@ -98,7 +98,7 @@ function Authed({ meId }: { meId: string }) {
   const [scope, setScope] = useState<Scope>('personal');
   const [searchQuery, setSearchQuery] = useState('');
   const [editing, setEditing] = useState<Card | null>(null);
-  const [captureOpen, setCaptureOpen] = useState<{ status: Status } | null>(null);
+  const [captureOpen, setCaptureOpen] = useState(false);
   const [reviewOpen, setReviewOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [archiveOpen, setArchiveOpen] = useState(false);
@@ -137,8 +137,7 @@ function Authed({ meId }: { meId: string }) {
   // Listen for FAB / keyboard-shortcut requests to open the capture modal.
   useEffect(() => {
     const handler = (e: Event) => {
-      const detail = (e as CustomEvent<{ status?: Status }>).detail ?? {};
-      setCaptureOpen({ status: detail.status ?? 'today' });
+      setCaptureOpen(true);
     };
     window.addEventListener('kanban:add-card', handler);
     return () => window.removeEventListener('kanban:add-card', handler);
@@ -506,11 +505,6 @@ function Authed({ meId }: { meId: string }) {
             style={{ width: '100%', maxWidth: 560 }}
           >
             <CaptureBar
-              initialStatus={captureOpen.status}
-              counts={STATUSES.reduce(
-                (acc, s) => ({ ...acc, [s]: cards.filter((c) => !c.archived && c.status === s).length }),
-                {} as Record<Status, number>,
-              )}
               autoFocus
               onCreate={async (title, status) => {
                 await handleCreate(title, status);

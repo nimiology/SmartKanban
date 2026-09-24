@@ -5,7 +5,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { MultipartFile } from '@fastify/multipart';
 import { pool } from '../db.js';
 import { requireUser } from '../auth.js';
-import { canUserSeeCard, isStatus, loadCard, logActivity, type Status } from '../cards.js';
+import { canUserSeeCard, loadCard, logActivity, type Status } from '../cards.js';
 import { broadcast } from '../ws.js';
 import { AI_ENABLED } from '../ai/openai.js';
 import { summarizeImage } from '../ai/vision.js';
@@ -39,12 +39,9 @@ async function readImagePart(req: FastifyRequest): Promise<{
   buffer: Buffer;
   mime: string;
   ext: string;
-  status?: string;
 }> {
-  // We accept exactly one image field named "file". Allow an optional `status`
-  // text field for the from-image endpoint.
+  // We accept exactly one image field named "file".
   let part: MultipartFile | null = null;
-  let status: string | undefined;
   // Pass our cap + 1 to busboy so anything above the real cap gets truncated
   // and we can detect it via `part.file.truncated`. Without this, the default
   // multipart fileSize limit (1 MB) silently truncates files long before our
@@ -54,9 +51,6 @@ async function readImagePart(req: FastifyRequest): Promise<{
     if (p.type === 'file' && p.fieldname === 'file' && !part) {
       part = p;
       break; // stream consumption stops at the first file; trailing fields would block.
-    }
-    if (p.type === 'field' && p.fieldname === 'status') {
-      status = String((p as unknown as { value: string }).value);
     }
   }
   if (!part) throw new HttpError(400, { error: 'file required' });
@@ -87,7 +81,6 @@ async function readImagePart(req: FastifyRequest): Promise<{
     buffer: Buffer.concat(chunks),
     mime: part.mimetype,
     ext: MIME_TO_EXT[part.mimetype] ?? '.bin',
-    status,
   };
 }
 
@@ -144,8 +137,8 @@ export async function attachmentUploadRoutes(app: FastifyInstance) {
     { preHandler: requireUser },
     async (req, reply) => {
       try {
-        const { buffer, mime, ext, status: statusRaw } = await readImagePart(req);
-        const status: Status = isStatus(statusRaw) ? statusRaw : 'today';
+        const { buffer, mime, ext } = await readImagePart(req);
+        const status: Status = 'inbox';
 
         // Insert a placeholder card first to get an id, then save the file under it.
         const userId = req.user!.id;
@@ -153,8 +146,8 @@ export async function attachmentUploadRoutes(app: FastifyInstance) {
         // across servers and clients with skewed clocks.
         const tsTitle = `Screenshot ${new Date().toISOString().slice(0, 16).replace('T', ' ')}`;
         const insertCard = await pool.query<{ id: string }>(
-          `INSERT INTO cards (title, description, status, source, created_by, position, needs_review)
-           VALUES ($1, '', $2, 'manual', $3,
+          `INSERT INTO cards (title, description, status, source, created_by, owner_user_id, position, needs_review)
+           VALUES ($1, '', $2, 'manual', $3, $3,
              COALESCE((SELECT MIN(position) - 1 FROM cards WHERE status = $2 AND NOT archived), 0),
              TRUE)
            RETURNING id`,

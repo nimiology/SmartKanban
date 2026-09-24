@@ -14,6 +14,7 @@ import { STATUSES } from '../types.ts';
 import { Column } from './Column.tsx';
 import { CardView } from './CardView.tsx';
 import { TrashDropZone } from './TrashDropZone.tsx';
+import { canMoveCard } from '../workflow.ts';
 
 type Props = {
   cards: Card[];
@@ -43,7 +44,9 @@ export function Board({ cards, users, searchQuery, unreadCounts, onCreate, onEdi
   }, [cards, searchQuery, searchActive]);
 
   const byStatus = useMemo(() => {
-    const map: Record<Status, Card[]> = { backlog: [], today: [], in_progress: [], done: [] };
+    const map: Record<Status, Card[]> = {
+      inbox: [], in_progress: [], ready_for_test: [], needs_fix: [], ready_for_release: [], released: [],
+    };
     for (const c of filteredCards) map[c.status].push(c);
     for (const s of STATUSES) map[s].sort((a, b) => a.position - b.position);
     return map;
@@ -84,6 +87,8 @@ export function Board({ cards, users, searchQuery, unreadCounts, onCreate, onEdi
       if (targetIndex < 0) targetIndex = targetCards.length;
     }
 
+    if (!canMoveCard(activeCard.status, targetStatus)) return;
+
     const before = targetIndex > 0 ? targetCards[targetIndex - 1]!.position : null;
     const after = targetIndex < targetCards.length ? targetCards[targetIndex]!.position : null;
     let newPosition: number;
@@ -108,7 +113,7 @@ export function Board({ cards, users, searchQuery, unreadCounts, onCreate, onEdi
         className="
           flex gap-3 overflow-x-auto snap-x snap-mandatory pb-2
           md:grid md:grid-cols-2 md:gap-4 md:overflow-visible md:pb-0
-          lg:grid-cols-4
+          lg:grid-cols-3 xl:grid-cols-6
         "
         style={{ scrollPaddingLeft: 12 }}
       >
@@ -139,7 +144,7 @@ export function Board({ cards, users, searchQuery, unreadCounts, onCreate, onEdi
         type="button"
         className="fab hidden md:inline-flex"
         style={{ width: '48px', height: '48px', right: '24px', bottom: '24px' }}
-        onClick={() => window.dispatchEvent(new CustomEvent('kanban:add-card', { detail: { status: 'today' } }))}
+        onClick={() => window.dispatchEvent(new CustomEvent('kanban:add-card', { detail: { status: 'inbox' } }))}
         aria-label="Add card to Today"
       >
         <span className="text-2xl leading-none" aria-hidden>+</span>

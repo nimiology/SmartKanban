@@ -1,4 +1,4 @@
-import { chatPrimary, chatFallback } from './openai.js';
+import { chatPrimary } from './openai.js';
 import { searchTavily, type TavilyResult } from './tavily.js';
 import { searchCardsFts, loadCard } from '../cards.js';
 import { searchKnowledgeFts } from '../knowledge.js';
@@ -169,7 +169,7 @@ export async function runBrainstorm(insightId: string): Promise<void> {
   const web: WebContext = { results: tavilyHits };
   const degraded = web.results.length === 0;
 
-  const target = chatPrimary() ?? chatFallback();
+  const target = chatPrimary();
   if (!target) {
     throw new Error('no AI configured');
   }
@@ -180,8 +180,7 @@ export async function runBrainstorm(insightId: string): Promise<void> {
   );
 
   const controller = new AbortController();
-  // OpenRouter → Gemini 2.0 Flash routinely exceeds 10s under load, which
-  // surfaced as "Request was aborted" failures on prod with no actual error.
+  // Keep synthesis bounded so an upstream timeout does not hold the request open.
   const timeoutMs = Number(process.env.BRAINSTORM_TIMEOUT_MS ?? 30_000);
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   let parsed: BrainstormParsed;

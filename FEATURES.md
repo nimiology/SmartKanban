@@ -147,7 +147,7 @@ A card is visible to a user if they:
 
 ### Photos
 - Auto-download the largest available Telegram photo
-- Summarize via vision model (OpenRouter or OpenAI)
+- Summarize via OpenAI vision model
 - Title and description extracted from the image; caption merged if present
 - Original `.jpg` attached to the card; inline thumbnail in the UI
 - `ai_summarized=true` on success; `needs_review=true` on vision failure
@@ -168,11 +168,11 @@ A card is visible to a user if they:
 
 ## 6. AI / LLM Features
 
-### Dual-Provider Architecture
-- **Primary**: OpenRouter (default model: `google/gemini-2.0-flash-001`)
-- **Fallback**: OpenAI (`gpt-4o-mini`)
+### OpenAI Provider
+- OpenAI (`gpt-4o-mini`) powers chat proposals, vision, and weekly summaries
+- OpenAI Whisper transcribes voice notes
 - Lazy client initialization — the app boots fine without any AI keys
-- `withChatFallback()` and `withVisionFallback()` helpers for automatic retry
+- AI-dependent features degrade gracefully when the API key is missing or a request fails
 
 ### Text-to-Card Proposal
 - Produces `{ is_actionable, title, description, tags, reason }` from free-form text
@@ -193,7 +193,7 @@ A card is visible to a user if they:
 - Returns null if AI is disabled or there are no items
 
 ### AI Enablement
-- `AI_ENABLED()` returns true if either OpenRouter or OpenAI key is configured
+- `AI_ENABLED()` returns true when `OPENAI_API_KEY` is configured
 - All AI-dependent features degrade gracefully when disabled
 
 **Key files:** `server/src/ai/openai.ts`, `server/src/ai/propose.ts`, `server/src/ai/vision.ts`, `server/src/ai/whisper.ts`, `server/src/ai/weekly_summary.ts`
@@ -328,9 +328,6 @@ A card is visible to a user if they:
 | `TELEGRAM_GROUP_ID` | Conditional | — | Required if bot enabled |
 | `TELEGRAM_WEBHOOK_URL` | No | — | Webhook URL (long-polling if unset) |
 | `TELEGRAM_WEBHOOK_SECRET` | No | `dev-webhook` | Webhook path secret |
-| `OPENROUTER_API_KEY` | No | — | Primary AI provider key |
-| `OPENROUTER_MODEL` | No | `google/gemini-2.0-flash-001` | Chat model |
-| `OPENROUTER_VISION_MODEL` | No | `google/gemini-2.0-flash-001` | Vision model |
-| `OPENAI_API_KEY` | No | — | Whisper + fallback AI key |
-| `APP_URL` | No | `http://localhost:8010` | Referer for OpenRouter |
+| `OPENAI_API_KEY` | No | — | Chat, vision, Whisper, and optional embeddings |
+| `APP_URL` | No | `http://localhost:8010` | Public app URL |
 | `ATTACHMENTS_DIR` | No | `data/attachments` | File storage directory |

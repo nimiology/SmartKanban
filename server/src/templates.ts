@@ -105,7 +105,7 @@ export async function createTemplate(ownerId: string, input: TemplateInput): Pro
       input.title,
       input.description ?? '',
       tags,
-      input.status ?? 'today',
+      input.status ?? 'inbox',
       input.due_offset_days ?? null,
     ],
   );
@@ -217,7 +217,7 @@ export async function instantiateTemplate(
   if (!t) return null;
   if (!canUserSeeTemplate(userId, t)) return null;
 
-  const status: Status = opts.statusOverride ?? t.status;
+  const status: Status = 'inbox';
   // Anchor to start of UTC day so adding N * 24h cannot drift into the prior or next day
   // because of when in the day Date.now() was sampled. Server-clock authoritative; matches
   // the README's skew-correction guarantee.
@@ -232,9 +232,9 @@ export async function instantiateTemplate(
 
   const { rows } = await pool.query<{ id: string }>(
     `INSERT INTO cards
-       (title, description, status, tags, due_date, source, created_by,
+       (title, description, status, tags, due_date, source, created_by, owner_user_id,
         telegram_chat_id, telegram_message_id, position)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9,
        COALESCE((SELECT MIN(position) - 1 FROM cards WHERE status = $3 AND NOT archived), 0))
      RETURNING id`,
     [

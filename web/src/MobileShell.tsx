@@ -28,25 +28,31 @@ const SCOPES: { value: Scope; label: string }[] = [
 ];
 
 const LANE_BG: Record<Status, string> = {
-  backlog:     'rgb(var(--lane-backlog))',
-  today:       'rgb(var(--lane-today))',
+  inbox:       'rgb(var(--lane-backlog))',
   in_progress: 'rgb(var(--lane-doing))',
-  done:        'rgb(var(--lane-done))',
+  ready_for_test: 'rgb(var(--lane-today))',
+  needs_fix: 'rgb(var(--lane-backlog))',
+  ready_for_release: 'rgb(var(--lane-doing))',
+  released: 'rgb(var(--lane-done))',
 };
 
 // Matches Column.tsx — used for the status dot before the lane title.
 const LANE_ACCENT: Record<Status, string> = {
-  backlog:     'backlog',
-  today:       'today',
+  inbox:       'backlog',
   in_progress: 'doing',
-  done:        'done',
+  ready_for_test: 'today',
+  needs_fix: 'backlog',
+  ready_for_release: 'doing',
+  released: 'done',
 };
 
 const EMPTY_MSG: Record<Status, string> = {
-  backlog:     'Empty backlog.',
-  today:       'Nothing planned for today.',
+  inbox:       'Nothing waiting for triage.',
   in_progress: 'Quiet here.',
-  done:        'Nothing finished yet.',
+  ready_for_test: 'Nothing waiting for peer test.',
+  needs_fix: 'No failed tests.',
+  ready_for_release: 'Nothing staged for release.',
+  released: 'Nothing released yet.',
 };
 
 function formatDate(): string {
@@ -74,7 +80,7 @@ function relTime(iso: string): string {
 export function MobileShell({ meId }: { meId: string }) {
   const [tab, setTab] = useState<Tab>('board');
   const [scope, setScope] = useState<Scope>('personal');
-  const [activeStatus, setActiveStatus] = useState<Status>('today');
+  const [activeStatus, setActiveStatus] = useState<Status>('inbox');
   const [cards, setCards] = useState<Card[]>([]);
   const [users, setUsers] = useState<User[]>([]);
   const [actionsCard, setActionsCard] = useState<Card | null>(null);
@@ -155,7 +161,9 @@ export function MobileShell({ meId }: { meId: string }) {
   }, [scope, meId]);
 
   const visible = cards.filter((c) => !c.archived);
-  const counts: Record<Status, number> = { backlog: 0, today: 0, in_progress: 0, done: 0 };
+  const counts: Record<Status, number> = {
+    inbox: 0, in_progress: 0, ready_for_test: 0, needs_fix: 0, ready_for_release: 0, released: 0,
+  };
   for (const c of visible) counts[c.status]++;
   const filtered = visible
     .filter((c) => c.status === activeStatus)
@@ -462,8 +470,6 @@ export function MobileShell({ meId }: { meId: string }) {
           zIndex: 30,
         }}>
           <CaptureBar
-            initialStatus={activeStatus}
-            counts={counts}
             onCreate={async (title, status) => {
               try {
                 const created = await api.createCard({ title, status });

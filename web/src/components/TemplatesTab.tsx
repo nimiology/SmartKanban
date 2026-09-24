@@ -24,7 +24,7 @@ const empty: FormState = {
   title: '',
   description: '',
   tags: '',
-  status: 'today',
+  status: 'inbox',
   dueOffsetDays: '',
 };
 

@@ -41,10 +41,10 @@ Instructions:
 3. Format: write your reply, then on a new line: <!-- suggestions: [{"label":"...","action":"update_status|set_due_date|assign_user|create_card","params":{...}}] -->
 4. If no suggestions are needed, omit the suggestions block entirely.
 5. Valid action types and params:
-   - update_status: { "status": "backlog"|"today"|"in_progress"|"done" }
+   - update_status: { "status": "inbox"|"in_progress"|"ready_for_test"|"needs_fix"|"ready_for_release"|"released" }
    - set_due_date: { "due_date": "YYYY-MM-DD" }
    - assign_user: { "user_id": "<uuid>" }
-   - create_card: { "title": "...", "status": "backlog" }
+   - create_card: { "title": "...", "status": "inbox" }
 6. Be concise. Max 3 suggestions.`;
 }
 

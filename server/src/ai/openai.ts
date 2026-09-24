@@ -2,26 +2,7 @@ import OpenAI from 'openai';
 
 // ---------- clients ----------
 // Lazily constructed so the server boots fine without any AI keys.
-let _openrouter: OpenAI | null | undefined;
 let _openai: OpenAI | null | undefined;
-
-export function openrouter(): OpenAI | null {
-  if (_openrouter !== undefined) return _openrouter;
-  const key = process.env.OPENROUTER_API_KEY;
-  if (!key) {
-    _openrouter = null;
-    return null;
-  }
-  _openrouter = new OpenAI({
-    apiKey: key,
-    baseURL: 'https://openrouter.ai/api/v1',
-    defaultHeaders: {
-      'HTTP-Referer': process.env.APP_URL ?? 'http://localhost',
-      'X-Title': 'Kanban Family',
-    },
-  });
-  return _openrouter;
-}
 
 export function openai(): OpenAI | null {
   if (_openai !== undefined) return _openai;
@@ -34,63 +15,41 @@ export function openai(): OpenAI | null {
   return _openai;
 }
 
-export const AI_ENABLED = () => !!(openrouter() || openai());
+export const AI_ENABLED = () => !!openai();
 
 // ---------- capability-typed targets ----------
 export type ChatTarget = { client: OpenAI; model: string; label: string };
 
-// Primary chat target: OpenRouter if configured, else OpenAI.
+// OpenAI is the configured provider for chat and vision.
 export function chatPrimary(): ChatTarget | null {
-  const or = openrouter();
-  if (or) {
-    return {
-      client: or,
-      model: process.env.OPENROUTER_MODEL ?? 'google/gemini-2.0-flash-001',
-      label: 'openrouter',
-    };
-  }
   const oa = openai();
   if (oa) return { client: oa, model: 'gpt-4o-mini', label: 'openai' };
   return null;
 }
 
-// Fallback chat target: OpenAI if both keys are set and the primary is OpenRouter.
-// Returns null if there is no fallback (either OpenAI is already primary, or no OpenAI key).
+// Kept for existing callers; this deployment uses one provider, so there is no
+// second target to retry after an OpenAI request fails.
 export function chatFallback(): ChatTarget | null {
-  const or = openrouter();
-  const oa = openai();
-  if (or && oa) return { client: oa, model: 'gpt-4o-mini', label: 'openai' };
   return null;
 }
 
 export function visionPrimary(): ChatTarget | null {
-  const or = openrouter();
-  if (or) {
-    return {
-      client: or,
-      model: process.env.OPENROUTER_VISION_MODEL ?? 'google/gemini-2.0-flash-001',
-      label: 'openrouter',
-    };
-  }
   const oa = openai();
   if (oa) return { client: oa, model: 'gpt-4o-mini', label: 'openai' };
   return null;
 }
 
 export function visionFallback(): ChatTarget | null {
-  const or = openrouter();
-  const oa = openai();
-  if (or && oa) return { client: oa, model: 'gpt-4o-mini', label: 'openai' };
   return null;
 }
 
-// Whisper is only on OpenAI (OpenRouter does not offer audio transcription).
+// Audio transcription uses OpenAI's Whisper API.
 export function audioClient(): OpenAI | null {
   return openai();
 }
 
-// Run fn against primary, falling back once on any thrown error. Returns null
-// if both paths fail (or primary is unset).
+// Keep the historical helper name for existing AI callers; this single-provider
+// deployment makes one OpenAI request and returns null on failure.
 async function _withChatFallback<T>(
   fn: (target: ChatTarget) => Promise<T>,
 ): Promise<T | null> {
@@ -102,18 +61,8 @@ async function _withChatFallback<T>(
   try {
     return await fn(primary);
   } catch (err) {
-    console.warn(`[ai] chat primary (${primary.label}/${primary.model}) failed:`, String(err).slice(0, 400));
-    const fb = chatFallback();
-    if (!fb) {
-      console.warn('[ai] chat: no fallback available');
-      return null;
-    }
-    try {
-      return await fn(fb);
-    } catch (err2) {
-      console.warn(`[ai] chat fallback (${fb.label}/${fb.model}) failed:`, String(err2).slice(0, 400));
-      return null;
-    }
+    console.warn(`[ai] chat (${primary.label}/${primary.model}) failed:`, String(err).slice(0, 400));
+    return null;
   }
 }
 
@@ -141,14 +90,7 @@ export async function withVisionFallback<T>(
   try {
     return await fn(primary);
   } catch (err) {
-    console.warn(`[ai] vision primary (${primary.label}/${primary.model}) failed:`, String(err).slice(0, 400));
-    const fb = visionFallback();
-    if (!fb) return null;
-    try {
-      return await fn(fb);
-    } catch (err2) {
-      console.warn(`[ai] vision fallback (${fb.label}/${fb.model}) failed:`, String(err2).slice(0, 400));
-      return null;
-    }
+    console.warn(`[ai] vision (${primary.label}/${primary.model}) failed:`, String(err).slice(0, 400));
+    return null;
   }
 }

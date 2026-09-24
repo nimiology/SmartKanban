@@ -11,10 +11,12 @@ type Props = {
 };
 
 const STATUS_EMOJI: Record<string, string> = {
-  backlog: '📥',
-  today: '📅',
+  inbox: '📥',
   in_progress: '⚡',
-  done: '✅',
+  ready_for_test: '🧪',
+  needs_fix: '🛠️',
+  ready_for_release: '🚀',
+  released: '✅',
 };
 
 function relativeAge(iso: string): string {

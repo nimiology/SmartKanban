@@ -8,17 +8,21 @@ type Props = {
 };
 
 const LANE_COLORS: Record<string, string> = {
-  backlog: 'rgb(var(--lane-backlog))',
-  today: 'rgb(var(--lane-today))',
+  inbox: 'rgb(var(--lane-backlog))',
   in_progress: 'rgb(var(--lane-doing))',
-  done: 'rgb(var(--lane-done))',
+  ready_for_test: 'rgb(var(--lane-today))',
+  needs_fix: 'rgb(var(--lane-backlog))',
+  ready_for_release: 'rgb(var(--lane-doing))',
+  released: 'rgb(var(--lane-done))',
 };
 
 const LANE_LABELS: Record<string, string> = {
-  backlog: 'Backlog',
-  today: 'Today',
-  in_progress: 'Doing',
-  done: 'Done',
+  inbox: 'Inbox',
+  in_progress: 'In Progress',
+  ready_for_test: 'Ready for Test',
+  needs_fix: 'Needs Fix',
+  ready_for_release: 'Ready for Release',
+  released: 'Released / Done',
 };
 
 export function ArchiveDialog({ onClose, onRestore }: Props) {

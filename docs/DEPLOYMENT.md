@@ -141,14 +141,7 @@ TELEGRAM_WEBHOOK_URL=https://kanban.example.com/telegram/webhook/<secret>
 TELEGRAM_WEBHOOK_SECRET=<paste another random hex>
 ```
 
-If you want AI features (proposal flow, vision summaries, weekly review):
-
-```
-OPENROUTER_API_KEY=sk-or-v1-…
-OPENROUTER_MODEL=google/gemini-2.0-flash-001
-```
-
-If you want voice transcription or AI fallback:
+For AI proposals, vision summaries, weekly review, and voice transcription:
 
 ```
 OPENAI_API_KEY=sk-…

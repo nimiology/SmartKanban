@@ -44,12 +44,14 @@ export function MirrorView() {
     };
   }, [token]);
 
-  const now = cards.filter((c) => c.status === 'today' || c.status === 'in_progress');
+  const active = cards.filter((c) => ['in_progress', 'ready_for_test', 'needs_fix'].includes(c.status));
   const grouped: Record<Status, Card[]> = {
-    backlog: [],
-    today: now.filter((c) => c.status === 'today'),
-    in_progress: now.filter((c) => c.status === 'in_progress'),
-    done: [],
+    inbox: [],
+    in_progress: active.filter((c) => c.status === 'in_progress'),
+    ready_for_test: active.filter((c) => c.status === 'ready_for_test'),
+    needs_fix: active.filter((c) => c.status === 'needs_fix'),
+    ready_for_release: [],
+    released: [],
   };
 
   return (
@@ -75,11 +77,11 @@ export function MirrorView() {
             </ul>
           </section>
         )}
-        {grouped.today.length > 0 && (
+        {grouped.ready_for_test.length > 0 && (
           <section className="mt-10">
-            <h2 className="text-2xl text-neutral-400">Today</h2>
+            <h2 className="text-2xl text-neutral-400">Ready for Test</h2>
             <ul className="mt-4 space-y-3">
-              {grouped.today.map((c) => (
+              {grouped.ready_for_test.map((c) => (
                 <li key={c.id} className="text-4xl font-light">
                   {c.title}
                 </li>
@@ -87,7 +89,15 @@ export function MirrorView() {
             </ul>
           </section>
         )}
-        {grouped.today.length === 0 && grouped.in_progress.length === 0 && !err && (
+        {grouped.needs_fix.length > 0 && (
+          <section className="mt-10">
+            <h2 className="text-2xl text-red-300">Needs Fix</h2>
+            <ul className="mt-4 space-y-3">
+              {grouped.needs_fix.map((c) => <li key={c.id} className="text-4xl font-light">{c.title}</li>)}
+            </ul>
+          </section>
+        )}
+        {active.length === 0 && !err && (
           <div className="mt-12 text-3xl text-neutral-600">Nothing on deck.</div>
         )}
       </div>

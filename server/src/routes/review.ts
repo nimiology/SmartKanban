@@ -19,7 +19,7 @@ export async function reviewRoutes(app: FastifyInstance) {
     const done = await pool.query<ReviewRow>(
       `SELECT c.id, c.title, c.status, c.updated_at, c.created_at, c.tags
        FROM cards c
-       WHERE NOT c.archived AND c.status = 'done' AND c.updated_at > NOW() - INTERVAL '7 days'
+       WHERE NOT c.archived AND c.status = 'released' AND c.updated_at > NOW() - INTERVAL '7 days'
          AND (c.created_by = $1
               OR EXISTS (SELECT 1 FROM card_assignees WHERE card_id = c.id AND user_id = $1))
        ORDER BY c.updated_at DESC`,
@@ -29,7 +29,7 @@ export async function reviewRoutes(app: FastifyInstance) {
     const stale = await pool.query<ReviewRow>(
       `SELECT c.id, c.title, c.status, c.updated_at, c.created_at, c.tags
        FROM cards c
-       WHERE NOT c.archived AND c.status IN ('today', 'in_progress')
+       WHERE NOT c.archived AND c.status IN ('inbox', 'in_progress', 'ready_for_test', 'needs_fix', 'ready_for_release')
          AND c.updated_at < NOW() - INTERVAL '7 days'
          AND (c.created_by = $1
               OR EXISTS (SELECT 1 FROM card_assignees WHERE card_id = c.id AND user_id = $1))

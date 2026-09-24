@@ -11,6 +11,7 @@ export function startReaper(): NodeJS.Timeout {
          WHERE outcome <> 'pending' AND outcome_at < NOW() - INTERVAL '5 minutes'`,
       );
       await pool.query(`DELETE FROM sessions WHERE expires_at < NOW()`);
+      await pool.query(`DELETE FROM telegram_context_messages WHERE expires_at <= NOW()`);
     } catch (err) {
       console.error('[reaper] cleanup error', err);
     }

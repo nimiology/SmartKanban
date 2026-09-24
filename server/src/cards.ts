@@ -1,11 +1,20 @@
 import { pool } from './db.js';
 
-export const STATUSES = ['backlog', 'today', 'in_progress', 'done'] as const;
+export const STATUSES = [
+  'inbox',
+  'in_progress',
+  'ready_for_test',
+  'needs_fix',
+  'ready_for_release',
+  'released',
+] as const;
 export type Status = (typeof STATUSES)[number];
 export const isStatus = (v: unknown): v is Status =>
   typeof v === 'string' && (STATUSES as readonly string[]).includes(v);
 
 export type Source = 'manual' | 'telegram' | 'mirror';
+export type WorkType = 'feature' | 'bug' | 'chore' | 'design';
+export type Priority = 'P0' | 'P1' | 'P2' | 'P3';
 
 export type Attachment = {
   id: string;
@@ -31,6 +40,16 @@ export type Card = {
   ai_summarized: boolean;
   needs_review: boolean;
   project: string | null;
+  owner_user_id: string | null;
+  tester_user_id: string | null;
+  work_type: WorkType;
+  priority: Priority;
+  acceptance_criteria: string[];
+  peer_test_result: 'not_started' | 'passed' | 'failed';
+  peer_test_notes: string;
+  branch_url: string | null;
+  pull_request_url: string | null;
+  release_id: string | null;
   assignees: string[];
   shares: string[];
   attachments: Attachment[];

@@ -1,4 +1,4 @@
-import { chatPrimary, chatFallback } from './openai.js';
+import { chatPrimary } from './openai.js';
 
 export type Candidate = {
   kind: 'card' | 'knowledge';
@@ -69,7 +69,7 @@ export async function rankCandidates(
 ): Promise<RankedMatch[]> {
   if (candidates.length === 0) return [];
 
-  const target = chatPrimary() ?? chatFallback();
+  const target = chatPrimary();
   if (!target) {
     return candidates.map((c) => ({ ...c }));
   }

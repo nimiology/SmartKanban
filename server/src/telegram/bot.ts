@@ -41,9 +41,19 @@ import {
   countTodayByUser,
 } from '../insights.js';
 import { enqueueBrainstorm } from '../ai/brainstorm_queue.js';
+import { isWorkflowAdmin, recordPeerTest, transitionCard, WorkflowError } from '../workflow.js';
+import {
+  forgetContextMessage,
+  rememberContextMessage,
+  REMEMBERED_CONTEXT_DAYS,
+  rememberedContextForPrompt,
+  searchRememberedContext,
+} from './remembered_context.js';
 
 let botInstance: Bot | null = null;
 let pollingStarted = false;
+let projectionTimer: ReturnType<typeof setInterval> | null = null;
+const projectingCards = new Set<string>();
 
 export function getBot(): Bot | null {
   return botInstance;
@@ -52,22 +62,37 @@ export function getBot(): Bot | null {
 const ATTACHMENTS_DIR = path.resolve(process.env.ATTACHMENTS_DIR ?? 'data/attachments');
 
 const STATUS_EMOJI: Record<Status, string> = {
-  backlog: '📥',
-  today: '📅',
+  inbox: '📥',
   in_progress: '⚡',
-  done: '✅',
+  ready_for_test: '🧪',
+  needs_fix: '🛠️',
+  ready_for_release: '🚀',
+  released: '✅',
 };
 
 const STATUS_LABEL: Record<Status, string> = {
-  backlog: 'Backlog',
-  today: 'Today',
-  in_progress: 'Doing',
-  done: 'Done',
+  inbox: 'Inbox',
+  in_progress: 'In Progress',
+  ready_for_test: 'Ready for Test',
+  needs_fix: 'Needs Fix',
+  ready_for_release: 'Ready for Release',
+  released: 'Released / Done',
 };
 
 function allowedGroupId(): number | null {
   const raw = process.env.TELEGRAM_GROUP_ID;
   return raw ? Number(raw) : null;
+}
+
+export async function hasTelegramWorkflowTopic(status: Status, workType: string): Promise<boolean> {
+  const groupId = allowedGroupId();
+  if (!groupId) return true;
+  const route = status === 'inbox' && workType === 'bug' ? 'bugs' : status;
+  const { rows } = await pool.query(
+    `SELECT 1 FROM telegram_workflow_topics WHERE group_chat_id = $1 AND route_key = $2`,
+    [groupId, route],
+  );
+  return rows.length > 0;
 }
 
 async function resolveAppUser(telegramUserId: number, username?: string): Promise<string | null> {
@@ -158,6 +183,9 @@ type CreateOpts = {
   createdBy: string;
   source: 'telegram';
   status?: Status;
+  workType?: 'feature' | 'bug' | 'chore' | 'design';
+  priority?: 'P0' | 'P1' | 'P2' | 'P3';
+  acceptanceCriteria?: string[];
   aiSummarized?: boolean;
   needsReview?: boolean;
   assignees?: string[];
@@ -166,13 +194,14 @@ type CreateOpts = {
 };
 
 async function createCard(opts: CreateOpts): Promise<string> {
-  const status: Status = opts.status ?? 'backlog';
+  const status: Status = opts.status ?? 'inbox';
   const { rows } = await pool.query<{ id: string }>(
     `INSERT INTO cards
       (title, description, status, tags, source, created_by, ai_summarized, needs_review,
-       telegram_chat_id, telegram_message_id, position)
+       telegram_chat_id, telegram_message_id, position, owner_user_id, work_type, priority, acceptance_criteria)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-       COALESCE((SELECT MIN(position) - 1 FROM cards WHERE status = $3 AND NOT archived), 0))
+       COALESCE((SELECT MIN(position) - 1 FROM cards WHERE status = $3 AND NOT archived), 0),
+       $11, $12, $13, $14)
      RETURNING id`,
     [
       opts.title.slice(0, 500),
@@ -185,6 +214,10 @@ async function createCard(opts: CreateOpts): Promise<string> {
       !!opts.needsReview,
       opts.telegramChatId ?? null,
       opts.telegramMessageId ?? null,
+      opts.createdBy,
+      opts.workType ?? 'chore',
+      opts.priority ?? 'P2',
+      opts.acceptanceCriteria ?? [],
     ],
   );
   const cardId = rows[0]!.id;
@@ -198,13 +231,164 @@ async function createCard(opts: CreateOpts): Promise<string> {
   return cardId;
 }
 
+const WORKFLOW_ROUTES: Record<string, Status | 'bugs'> = {
+  inbox: 'inbox',
+  'in-progress': 'in_progress',
+  'ready-for-test': 'ready_for_test',
+  'needs-fix': 'needs_fix',
+  'ready-for-release': 'ready_for_release',
+  released: 'released',
+  bugs: 'bugs',
+};
+
+async function projectCardToTopic(cardId: string): Promise<void> {
+  await pool.query(
+    `INSERT INTO telegram_projection_outbox (card_id) VALUES ($1)
+     ON CONFLICT (card_id) DO UPDATE SET next_attempt_at = NOW(), updated_at = NOW()`,
+    [cardId],
+  );
+  if (projectingCards.has(cardId)) return;
+  projectingCards.add(cardId);
+  try {
+    const delivered = await projectCardToTopicUnsafe(cardId);
+    if (!delivered) {
+      await pool.query(
+        `UPDATE telegram_projection_outbox SET attempts = attempts + 1,
+           next_attempt_at = NOW() + LEAST(3600, 30 * POWER(2, LEAST(attempts, 7))) * INTERVAL '1 second',
+           last_error = 'projection unavailable or not delivered', updated_at = NOW()
+         WHERE card_id = $1`, [cardId],
+      );
+    }
+  } catch (error) {
+    console.error('[telegram] task topic projection failed:', error);
+    await pool.query(
+      `UPDATE telegram_projection_outbox SET attempts = attempts + 1,
+         next_attempt_at = NOW() + LEAST(3600, 30 * POWER(2, LEAST(attempts, 7))) * INTERVAL '1 second',
+         last_error = $2, updated_at = NOW()
+       WHERE card_id = $1`,
+      [cardId, String(error).slice(0, 500)],
+    ).catch(() => {});
+  } finally {
+    projectingCards.delete(cardId);
+  }
+}
+
+export async function publishTelegramTaskProjection(cardId: string): Promise<void> {
+  await projectCardToTopic(cardId);
+}
+
+async function projectCardToTopicUnsafe(cardId: string): Promise<boolean> {
+  const groupId = allowedGroupId();
+  if (!groupId || !botInstance) return false;
+  const card = await loadCard(cardId);
+  if (!card) return false;
+  const routeKey = card.status === 'inbox' && card.work_type === 'bug' ? 'bugs' : card.status;
+  const { rows: topicRows } = await pool.query<{ thread_id: string }>(
+    `SELECT thread_id FROM telegram_workflow_topics WHERE group_chat_id = $1 AND route_key = $2`,
+    [groupId, routeKey],
+  );
+  const threadId = topicRows[0]?.thread_id;
+  if (!threadId) return false;
+
+  const owner = card.owner_user_id ? await pool.query<{ name: string }>(
+    `SELECT name FROM users WHERE id = $1`, [card.owner_user_id],
+  ) : { rows: [] as Array<{ name: string }> };
+  const tester = card.tester_user_id ? await pool.query<{ name: string }>(
+    `SELECT name FROM users WHERE id = $1`, [card.tester_user_id],
+  ) : { rows: [] as Array<{ name: string }> };
+  const lines = [
+    `${STATUS_EMOJI[card.status]} ${card.title}`,
+    `#${card.work_type} · ${card.priority} · ${STATUS_LABEL[card.status]}`,
+    `Owner: ${owner.rows[0]?.name ?? 'unassigned'} · Tester: ${tester.rows[0]?.name ?? 'unassigned'}`,
+    `Task ID: ${card.id}`,
+  ];
+  if (card.acceptance_criteria.length) lines.push(`Acceptance: ${card.acceptance_criteria.join(' · ')}`);
+  if (card.branch_url) lines.push(`Branch: ${card.branch_url}`);
+  if (card.pull_request_url) lines.push(`PR: ${card.pull_request_url}`);
+  if (card.peer_test_notes) lines.push(`Test notes: ${card.peer_test_notes}`);
+  const nextUserIds = card.status === 'ready_for_test'
+    ? (card.tester_user_id ? [card.tester_user_id] : [])
+    : card.status === 'needs_fix'
+      ? (card.owner_user_id ? [card.owner_user_id] : [])
+      : card.status === 'ready_for_release' || card.status === 'released'
+        ? (await pool.query<{ id: string }>(`SELECT id FROM users WHERE is_admin`)).rows.map((row) => row.id)
+        : [];
+  if (nextUserIds.length) {
+    const { rows } = await pool.query<{ telegram_username: string | null; name: string | null }>(
+      `SELECT DISTINCT ON (u.id) ti.telegram_username, u.short_name AS name
+       FROM users u LEFT JOIN telegram_identities ti ON ti.app_user_id = u.id
+       WHERE u.id = ANY($1::uuid[]) ORDER BY u.id, ti.created_at ASC`,
+      [nextUserIds],
+    );
+    const mentions = rows.map((row) => row.telegram_username ? `@${row.telegram_username}` : row.name ?? 'teammate');
+    if (mentions.length) lines.push(`Next: ${mentions.join(', ')}`);
+  }
+  const prior = await pool.query<{ message_id: string; thread_id: string }>(
+    `SELECT message_id, thread_id FROM telegram_task_messages
+     WHERE card_id = $1 AND is_current LIMIT 1`, [cardId],
+  );
+  const moved = prior.rows[0]
+    ? `\n↪ Moved to ${routeKey.replaceAll('_', ' ')}. The current task card is posted below.`
+    : '';
+  if (prior.rows[0]) {
+    try {
+      await botInstance.api.editMessageText(
+        groupId,
+        Number(prior.rows[0].message_id),
+        `${card.title}\n${moved}`,
+      );
+    } catch { /* old projection may have been deleted or become uneditable */ }
+  }
+  let sent;
+  try {
+    sent = await botInstance.api.sendMessage(groupId, lines.join('\n'), {
+      message_thread_id: Number(threadId),
+      link_preview_options: { is_disabled: true },
+      reply_markup: postSaveKeyboard(card.id, card.status),
+    });
+  } catch (error) {
+    console.error('[telegram] task topic projection failed:', error);
+    return false;
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`UPDATE telegram_task_messages SET is_current = FALSE WHERE card_id = $1 AND is_current`, [cardId]);
+    await client.query(
+      `INSERT INTO telegram_task_messages (card_id, chat_id, thread_id, message_id, is_current)
+       VALUES ($1, $2, $3, $4, TRUE)`,
+      [cardId, groupId, threadId, sent.message_id],
+    );
+    await client.query(`DELETE FROM telegram_projection_outbox WHERE card_id = $1`, [cardId]);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('[telegram] task projection index update failed:', error);
+    return false;
+  } finally {
+    client.release();
+  }
+  return true;
+}
+
+async function flushProjectionOutbox(): Promise<void> {
+  const { rows } = await pool.query<{ card_id: string }>(
+    `SELECT card_id FROM telegram_projection_outbox WHERE next_attempt_at <= NOW()
+     ORDER BY updated_at LIMIT 25`,
+  );
+  for (const row of rows) await projectCardToTopic(row.card_id);
+}
+
 async function cardForReply(
   chatId: number | undefined,
   replyToMessageId: number | undefined,
 ): Promise<string | null> {
   if (!chatId || !replyToMessageId) return null;
   const { rows } = await pool.query<{ id: string }>(
-    `SELECT id FROM cards WHERE telegram_chat_id = $1 AND telegram_message_id = $2 LIMIT 1`,
+    `SELECT id FROM cards WHERE telegram_chat_id = $1 AND telegram_message_id = $2
+     UNION ALL
+     SELECT card_id AS id FROM telegram_task_messages
+     WHERE chat_id = $1 AND message_id = $2 LIMIT 1`,
     [chatId, replyToMessageId],
   );
   return rows[0]?.id ?? null;
@@ -296,9 +480,13 @@ function destinationKeyboard(
   pid: string,
   def: Destination,
   isPrivateChat: boolean,
+  taskOnly = false,
 ): InlineKeyboard {
   const kb = new InlineKeyboard();
-  for (const o of destinationOptions(isPrivateChat)) {
+  const options = destinationOptions(isPrivateChat).filter(
+    (option) => !taskOnly || option.key !== 'knowledge',
+  );
+  for (const o of options) {
     kb.text(`${o.key === def ? '✓ ' : ''}${o.label}`, `dest:${o.key}:${pid}`);
   }
   kb.row()
@@ -311,12 +499,7 @@ function destinationKeyboard(
 }
 
 function columnKeyboard(pid: string): InlineKeyboard {
-  return new InlineKeyboard()
-    .text('📥 Backlog', `col:backlog:${pid}`)
-    .text('📅 Today', `col:today:${pid}`)
-    .row()
-    .text('⚡ In Progress', `col:in_progress:${pid}`)
-    .text('✅ Done', `col:done:${pid}`);
+  return new InlineKeyboard().text('📥 Inbox', `col:inbox:${pid}`);
 }
 
 function attachmentKindKeyboard(pid: string): InlineKeyboard {
@@ -358,17 +541,23 @@ function dupResultsKeyboard(
 
 function postSaveKeyboard(cardId: string, currentStatus: Status): InlineKeyboard {
   const kb = new InlineKeyboard();
-  const row: Array<['📅 Today' | '⚡ Doing' | '✅ Done', Status, string]> = [
-    ['📅 Today', 'today', `mv:today:${cardId}`],
-    ['⚡ Doing', 'in_progress', `mv:doing:${cardId}`],
-    ['✅ Done', 'done', `mv:done:${cardId}`],
-  ];
-  for (const [label, s, cb] of row) {
-    if (s !== currentStatus) kb.text(label, cb);
+  if (currentStatus === 'inbox') kb.text('▶️ Start', `wf:start:${cardId}`);
+  if (currentStatus === 'in_progress') kb.text('🧪 Submit for test', `wf:test:${cardId}`);
+  if (currentStatus === 'ready_for_test') {
+    kb.text('✅ Approve', `wf:approve:${cardId}`).text('🛠️ Needs fix', `wf:fail:${cardId}`);
   }
   kb.text('🗑', `arch:${cardId}`);
   kb.row().text('🤔 Brainstorm', `brain:${cardId}`);
   return kb;
+}
+
+function taskContextDetails(pending: PendingProposal): Record<string, unknown> {
+  if (pending.taskSourceMessageId === undefined) return {};
+  return {
+    source_message_id: pending.taskSourceMessageId,
+    source_thread_id: pending.taskSourceThreadId ?? 0,
+    remembered_context_message_ids: pending.contextMessageIds ?? [],
+  };
 }
 
 async function sendProposal(
@@ -382,7 +571,12 @@ async function sendProposal(
   try {
     const msg = await ctx.reply(proposalText(p, links), {
       parse_mode: 'Markdown',
-      reply_markup: destinationKeyboard(pendingId, def, isPrivateChat),
+      reply_markup: destinationKeyboard(
+        pendingId,
+        def,
+        isPrivateChat,
+        getPending(pendingId)?.taskSourceMessageId !== undefined,
+      ),
       reply_parameters: { message_id: ctx.msg!.message_id, allow_sending_without_reply: true },
     });
     return msg.message_id;
@@ -407,7 +601,12 @@ async function handleText(
   if (tgUserId && !command) {
     const existing = getLatestForUser(tgUserId);
     if (existing && existing.awaitingEdit) {
-      const revised = await proposeFromText(existing.original, existing.proposal, text);
+      const revised = await proposeFromText(
+        existing.original,
+        existing.proposal,
+        text,
+        existing.contextSnippets,
+      );
       if (revised) {
         updatePending(existing.id, { proposal: revised, awaitingEdit: false });
         const msgId = await sendProposal(
@@ -452,10 +651,349 @@ async function handleText(
     }
   }
 
-  // Reply-based commands: /assign, /share, /today operate on the referenced card.
+  // Reply-based commands: /assign, /share, and workflow actions use the referenced card.
   const replyToId = ctx.msg?.reply_to_message?.message_id;
   const chatId = ctx.chat?.id;
   const referencedCardId = await cardForReply(chatId, replyToId);
+
+  if (command === 'release' || command === 'done') {
+    if (isPrivate || chatId !== allowedGroupId() || !(await isWorkflowAdmin(createdBy))) {
+      await ctx.reply('Release checks are available to workflow admins in the configured group.');
+      return;
+    }
+    const match = rest.trim().match(/^(\S+)\s+([a-f0-9]{40})\s+(pass|fail)(?:\s+([\s\S]+))?$/i);
+    if (!match) {
+      await ctx.reply(command === 'release'
+        ? 'Usage: `/release <version> <commit-sha> <pass|fail> [staging notes]`'
+        : 'Usage: `/done <version> <commit-sha> <pass|fail> [production smoke notes]`',
+      { parse_mode: 'Markdown' });
+      return;
+    }
+    const [, version, rawSha, result, notes = ''] = match;
+    const sha = rawSha!.toLowerCase();
+    const passed = result!.toLowerCase() === 'pass';
+    if (command === 'release') {
+      const { rows } = await pool.query<{ id: string }>(
+        `INSERT INTO workflow_releases (version, commit_sha, staging_result, staging_notes, created_by)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (version) DO UPDATE SET
+           staging_result = EXCLUDED.staging_result,
+           staging_notes = EXCLUDED.staging_notes,
+           updated_at = NOW()
+         WHERE workflow_releases.commit_sha = EXCLUDED.commit_sha
+           AND workflow_releases.production_result <> 'passed'
+         RETURNING id`,
+        [version, sha, passed ? 'passed' : 'failed', notes.slice(0, 2_000), createdBy],
+      );
+      if (!rows[0]) {
+        await ctx.reply('That version already exists with a different commit SHA or has completed production release.');
+        return;
+      }
+      const linked = passed
+        ? await pool.query(
+          `UPDATE cards SET release_id = $1, updated_at = NOW()
+           WHERE status = 'ready_for_release' AND NOT archived AND (release_id IS NULL OR release_id = $1)`,
+          [rows[0].id],
+        )
+        : { rowCount: 0 };
+      await ctx.reply(passed
+        ? `✅ Staging passed for ${version} (${sha.slice(0, 12)}). Linked ${linked.rowCount ?? 0} Ready for Release tasks. Run /done after production smoke checks.`
+        : `❌ Staging failed for ${version} (${sha.slice(0, 12)}). ${notes ? 'Notes recorded.' : 'Add notes with the command.'}`);
+      return;
+    }
+
+    const client = await pool.connect();
+    let releasedIds: string[] = [];
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query<{
+        id: string; commit_sha: string; staging_result: string; production_result: string;
+      }>(
+        `SELECT id, commit_sha, staging_result, production_result
+         FROM workflow_releases WHERE version = $1 FOR UPDATE`, [version],
+      );
+      const release = rows[0];
+      if (!release || release.commit_sha.toLowerCase() !== sha) {
+        throw new WorkflowError('Release version or exact commit SHA does not match staging.');
+      }
+      if (release.staging_result !== 'passed') {
+        throw new WorkflowError('Production cannot be marked until staging has passed.');
+      }
+      if (release.production_result === 'passed') {
+        throw new WorkflowError('This release has already passed production smoke checks.');
+      }
+      await client.query(
+        `UPDATE workflow_releases SET production_result = $2, production_notes = $3,
+           deployed_at = CASE WHEN $2 = 'passed' THEN NOW() ELSE deployed_at END, updated_at = NOW()
+         WHERE id = $1`,
+        [release.id, passed ? 'passed' : 'failed', notes.slice(0, 2_000)],
+      );
+      if (passed) {
+        const cards = await client.query<{ id: string; status: Status }>(
+          `UPDATE cards SET status = 'released', updated_at = NOW()
+           WHERE release_id = $1 AND status = 'ready_for_release' AND NOT archived
+           RETURNING id, status`, [release.id],
+        );
+        releasedIds = cards.rows.map((card) => card.id);
+        for (const id of releasedIds) {
+          await client.query(
+            `INSERT INTO card_events (actor_id, card_id, action, details)
+             VALUES ($1, $2, 'workflow.transition', $3)`,
+            [createdBy, id, { from: 'ready_for_release', to: 'released', release_version: version, commit_sha: sha }],
+          );
+          await client.query(
+            `INSERT INTO telegram_projection_outbox (card_id) VALUES ($1)
+             ON CONFLICT (card_id) DO UPDATE SET next_attempt_at = NOW(), updated_at = NOW()`, [id],
+          );
+        }
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      await ctx.reply(error instanceof WorkflowError ? error.message : 'Could not record production verification.');
+      return;
+    } finally {
+      client.release();
+    }
+    for (const id of releasedIds) {
+      const card = await loadCard(id);
+      if (card) {
+        broadcast({ type: 'card.updated', card });
+        await projectCardToTopic(id);
+      }
+    }
+    await ctx.reply(passed
+      ? `✅ Production smoke passed for ${version}. Released ${releasedIds.length} tasks.`
+      : `❌ Production smoke failed for ${version}. Tasks remain Ready for Release.`);
+    return;
+  }
+
+  if (command === 'topics') {
+    const allowed = allowedGroupId();
+    if (isPrivate || chatId === undefined || allowed === null || chatId !== allowed) {
+      await ctx.reply('Topic management is available only in the configured Telegram group.');
+      return;
+    }
+    if (!(await isWorkflowAdmin(createdBy))) {
+      await ctx.reply('Only a workflow admin can bind topic routes.');
+      return;
+    }
+    const [action, route] = rest.trim().toLowerCase().split(/\s+/, 2);
+    if (action === 'bind') {
+      const routeKey = route ? WORKFLOW_ROUTES[route] : undefined;
+      const threadId = ctx.msg?.message_thread_id;
+      if (!routeKey || !threadId) {
+        await ctx.reply('Open a forum topic and run `/topics bind inbox|in-progress|ready-for-test|needs-fix|ready-for-release|released|bugs` there.', { parse_mode: 'Markdown' });
+        return;
+      }
+      try {
+        await pool.query(
+          `INSERT INTO telegram_workflow_topics (group_chat_id, route_key, thread_id, bound_by)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (group_chat_id, route_key) DO UPDATE
+             SET thread_id = EXCLUDED.thread_id, bound_by = EXCLUDED.bound_by, updated_at = NOW()`,
+          [chatId, routeKey, threadId, createdBy],
+        );
+        await ctx.reply(`Bound this topic to ${routeKey === 'bugs' ? 'Bugs / Triage' : STATUS_LABEL[routeKey]}.`);
+      } catch (error) {
+        console.error('[telegram] topic bind failed:', error);
+        await ctx.reply('That topic is already bound to another workflow route. Check `/topics status`.');
+      }
+      return;
+    }
+    if (action === 'status') {
+      const { rows } = await pool.query<{ route_key: string; thread_id: string }>(
+        `SELECT route_key, thread_id FROM telegram_workflow_topics WHERE group_chat_id = $1 ORDER BY route_key`,
+        [chatId],
+      );
+      await ctx.reply(rows.length
+        ? `Workflow topic bindings:\n${rows.map((row) => `• ${row.route_key}: topic ${row.thread_id}`).join('\n')}`
+        : 'No topic routes are bound. Run `/topics bind <route>` from each forum topic.',
+      { parse_mode: 'Markdown' });
+      return;
+    }
+    await ctx.reply('Use `/topics status` or run `/topics bind <route>` from inside a forum topic.', { parse_mode: 'Markdown' });
+    return;
+  }
+
+  if (['start', 'test', 'approve', 'fail'].includes(command ?? '')) {
+    const allowed = allowedGroupId();
+    if (isPrivate || chatId === undefined || allowed === null || chatId !== allowed) {
+      await ctx.reply('Workflow actions are available only in the configured Telegram group.');
+      return;
+    }
+    if (!referencedCardId) {
+      await ctx.reply(`Reply to a task card with /${command}${command === 'fail' ? ' <test notes>' : ''}.`);
+      return;
+    }
+    try {
+      const targetStatus: Status = command === 'start' ? 'in_progress'
+        : command === 'test' ? 'ready_for_test'
+          : command === 'approve' ? 'ready_for_release' : 'needs_fix';
+      const task = await loadCard(referencedCardId);
+      if (task && !(await hasTelegramWorkflowTopic(targetStatus, task.work_type))) {
+        await ctx.reply(`Bind the ${STATUS_LABEL[targetStatus]} topic first with /topics bind ${targetStatus.replaceAll('_', '-')}.`);
+        return;
+      }
+      const updated = command === 'start'
+        ? await transitionCard(referencedCardId, createdBy, 'in_progress')
+        : command === 'test'
+          ? await transitionCard(referencedCardId, createdBy, 'ready_for_test')
+          : await recordPeerTest(referencedCardId, createdBy, command === 'approve', rest.trim());
+      broadcast({ type: 'card.updated', card: updated });
+      await projectCardToTopic(updated.id);
+      await ctx.reply(`${STATUS_EMOJI[updated.status]} ${updated.title} → ${STATUS_LABEL[updated.status]}`);
+    } catch (error) {
+      if (error instanceof WorkflowError) await ctx.reply(error.message);
+      else {
+        console.error('[telegram] workflow action failed:', error);
+        await ctx.reply('Could not update that task.');
+      }
+    }
+    return;
+  }
+
+  if (command === 'remember' || command === 'forget') {
+    const allowed = allowedGroupId();
+    const source = ctx.msg?.reply_to_message;
+    const sourceText = (source?.text ?? source?.caption ?? '').trim();
+    if (isPrivate || chatId === undefined || allowed === null || chatId !== allowed) {
+      await ctx.reply('This command is available only in the configured Telegram group.');
+      return;
+    }
+    if (!source || !source.message_id) {
+      await ctx.reply(`Reply to a text message with /${command}${command === 'remember' && rest.trim() ? ' <optional note>' : ''}.`);
+      return;
+    }
+    if (!sourceText || source.from?.is_bot || source.from?.id === undefined) {
+      await ctx.reply('I can remember text messages from people, not bot messages or media without a caption.');
+      return;
+    }
+    const threadId = source.message_thread_id ?? ctx.msg?.message_thread_id ?? 0;
+    try {
+      if (command === 'remember') {
+        await rememberContextMessage({
+          chatId,
+          threadId,
+          messageId: source.message_id,
+          sourceUserId: source.from.id,
+          rememberedBy: createdBy,
+          body: sourceText,
+          note: rest,
+        });
+        await ctx.reply(`🧠 Remembered for ${REMEMBERED_CONTEXT_DAYS} days. It can be used as task context only in this same topic.`);
+      } else {
+        const removed = await forgetContextMessage(
+          chatId,
+          threadId,
+          source.message_id,
+          createdBy,
+          ctx.from!.id,
+        );
+        await ctx.reply(removed
+          ? '🗑 Removed from remembered context.'
+          : 'Not found, or only the person who remembered it or the original author can forget it.');
+      }
+    } catch (error) {
+      console.error('[telegram] remembered-context command failed:', error);
+      await ctx.reply('Could not update remembered context. Check that the database schema has been applied.');
+    }
+    return;
+  }
+
+  if (command === 'task') {
+    const allowed = allowedGroupId();
+    const source = ctx.msg?.reply_to_message;
+    if (isPrivate || chatId === undefined || allowed === null || chatId !== allowed) {
+      await ctx.reply('Use /task as a reply inside the configured Telegram group.');
+      return;
+    }
+    if (!source || source.from?.is_bot || !(source.text ?? source.caption)?.trim()) {
+      await ctx.reply('Reply to a person\'s text message with /task <instruction>.');
+      return;
+    }
+
+    const sourceText = (source.text ?? source.caption ?? '').trim().slice(0, 2_000);
+    const instruction = rest.trim().slice(0, 1_000);
+    const guessedType = /#bug\b|\bbug\b/i.test(`${instruction} ${sourceText}`) ? 'bug' : 'chore';
+    if (!(await hasTelegramWorkflowTopic('inbox', guessedType))) {
+      await ctx.reply(`Bind the ${guessedType === 'bug' ? 'Bugs / Triage' : 'Inbox'} topic first with /topics bind ${guessedType === 'bug' ? 'bugs' : 'inbox'}.`);
+      return;
+    }
+    const original = [
+      instruction ? `Task instruction: ${instruction}` : 'Task instruction: Create a task from the replied-to message.',
+      `Replied-to message: ${sourceText}`,
+    ].join('\n');
+    const threadId = source.message_thread_id ?? ctx.msg?.message_thread_id ?? 0;
+    let remembered = [] as Awaited<ReturnType<typeof searchRememberedContext>>;
+    if (AI_ENABLED()) {
+      try {
+        remembered = await searchRememberedContext(
+          chatId,
+          threadId,
+          `${instruction} ${sourceText}`,
+        );
+      } catch (error) {
+        console.error('[telegram] remembered-context search failed:', error);
+        await ctx.reply('Remembered context is temporarily unavailable; continuing with the replied-to message only.');
+      }
+    }
+    const contextSnippets = rememberedContextForPrompt(remembered);
+    if (AI_ENABLED() && ctx.from?.id !== undefined) {
+      const proposal = await proposeFromText(original, undefined, undefined, contextSnippets);
+      if (proposal) {
+        const pending = createPending({
+          tgUserId: ctx.from.id,
+          appUserId: createdBy,
+          chatId,
+          isPrivateChat: false,
+          original,
+          proposal,
+        });
+        updatePending(pending.id, {
+          contextSnippets,
+          contextMessageIds: remembered.map((item) => item.message_id),
+          taskSourceMessageId: source.message_id,
+          taskSourceThreadId: threadId,
+          taskWorkType: guessedType,
+        });
+        const lines = remembered.slice(0, 4).map((item) =>
+          `• #${item.message_id}: ${item.body.replace(/\s+/g, ' ').slice(0, 140)}`,
+        );
+        await ctx.reply(remembered.length
+          ? `🔎 Remembered context used from this topic:\n${lines.join('\n')}`
+          : 'ℹ️ No matching remembered messages in this topic; using only your reply and instruction.');
+        const links = extractUrls(sourceText);
+        const promptMessageId = await sendProposal(ctx, pending.id, proposal, false, links);
+        updatePending(pending.id, { promptMessageId });
+        return;
+      }
+    }
+
+    const { title, description } = splitTitleDesc(sourceText);
+    const cardId = await createCard({
+      title,
+      description: [description, instruction ? `Instruction: ${instruction}` : ''].filter(Boolean).join('\n\n'),
+      createdBy,
+      source: 'telegram',
+      status: 'inbox',
+      workType: guessedType,
+      telegramChatId: chatId,
+      telegramMessageId: ctx.msg?.message_id,
+    });
+    await logActivity(createdBy, cardId, 'telegram.task', {
+      source_message_id: source.message_id,
+      source_thread_id: threadId,
+      remembered_context_message_ids: remembered.map((item) => item.message_id),
+    });
+    const card = await loadCard(cardId);
+    if (card) broadcast({ type: 'card.created', card });
+    await projectCardToTopic(cardId);
+    await ctx.reply(`✓ Saved · ${STATUS_EMOJI.inbox} ${STATUS_LABEL.inbox} — ${title}`, {
+      reply_markup: postSaveKeyboard(cardId, 'inbox'),
+    });
+    return;
+  }
 
   if (command === 'assign' && referencedCardId) {
     const userIds = await usersFromMentions(extractMentions(rest));
@@ -494,7 +1032,7 @@ async function handleText(
     return;
   }
 
-  // Fast path for /today: skip the proposal round-trip since intent is explicit.
+  // Legacy /today alias creates a task in the new Inbox workflow.
   const { tags, text: clean } = extractHashtags(body);
   if (command === 'today') {
     const { title, description } = splitTitleDesc(clean);
@@ -505,7 +1043,7 @@ async function handleText(
       tags,
       createdBy,
       source: 'telegram',
-      status: 'today',
+      status: 'inbox',
       telegramChatId: chatId,
       telegramMessageId: ctx.msg?.message_id,
       assignees: isPrivate ? [createdBy] : undefined,
@@ -610,7 +1148,7 @@ async function handleText(
     tags,
     createdBy,
     source: 'telegram',
-    status: 'backlog',
+      status: 'inbox',
     telegramChatId: chatId,
     telegramMessageId: ctx.msg?.message_id,
     assignees: isPrivate ? [createdBy] : undefined,
@@ -797,6 +1335,7 @@ async function finalizeCard(
     createdBy: pending.appUserId,
     source: 'telegram',
     status,
+    workType: pending.taskWorkType ?? 'chore',
     aiSummarized: true,
     assignees,
     telegramChatId: pending.chatId,
@@ -821,8 +1360,18 @@ async function finalizeCard(
   if (card) {
     broadcast({ type: 'card.created', card });
   }
+  if (pending.taskSourceMessageId !== undefined) await projectCardToTopic(cardId);
 
-  await logActivity(pending.appUserId, cardId, isPrivate ? 'telegram.text.private' : 'telegram.text');
+  await logActivity(
+    pending.appUserId,
+    cardId,
+    pending.taskSourceMessageId !== undefined
+      ? 'telegram.task'
+      : isPrivate
+        ? 'telegram.text.private'
+        : 'telegram.text',
+    taskContextDetails(pending),
+  );
   deletePending(pending.id);
   const emoji = STATUS_EMOJI[status];
   const label = STATUS_LABEL[status];
@@ -940,7 +1489,7 @@ async function attachToTarget(
     // Knowledge items don't support binary attachments — fall back to new private card.
     await ctx.reply("Knowledge items don't support attachments yet — saving as new card instead.");
     updatePending(pending.id, { destination: 'private_card', attachMode: 'new' });
-    await finalizeCard(ctx, pending, 'backlog');
+    await finalizeCard(ctx, pending, 'inbox');
     return;
   }
   deletePending(pending.id);
@@ -1000,14 +1549,14 @@ async function runDuplicateCheck(ctx: Context, pending: PendingProposal): Promis
 
 // ---------- bot wiring ----------
 
-// Post-save quick actions: move / archive. Callback shape: "mv:<status>:<uuid>" or "arch:<uuid>".
+// Post-save quick actions use the same server-side transition rules as slash commands.
 async function handlePostSaveCallback(ctx: Context): Promise<boolean> {
   const data = ctx.callbackQuery?.data ?? '';
-  const moveMatch = data.match(/^mv:(today|doing|done):([0-9a-f-]{36})$/);
+  const workflowMatch = data.match(/^wf:(start|test|approve|fail):([0-9a-f-]{36})$/);
   const archMatch = data.match(/^arch:([0-9a-f-]{36})$/);
-  if (!moveMatch && !archMatch) return false;
+  if (!workflowMatch && !archMatch) return false;
 
-  const cardId = (moveMatch ? moveMatch[2]! : archMatch![1]!);
+  const cardId = workflowMatch ? workflowMatch[2]! : archMatch![1]!;
   const tgUser = ctx.from;
   const appUserId = tgUser ? await resolveAppUser(tgUser.id) : null;
   const { rows } = await pool.query<{ created_by: string | null }>(
@@ -1015,7 +1564,7 @@ async function handlePostSaveCallback(ctx: Context): Promise<boolean> {
     [cardId],
   );
   const creator = rows[0]?.created_by ?? null;
-  if (!appUserId || !creator || appUserId !== creator) {
+  if (!appUserId || (archMatch && (!creator || appUserId !== creator))) {
     await ctx.answerCallbackQuery({ text: 'Only the creator can change this.' });
     return true;
   }
@@ -1034,17 +1583,27 @@ async function handlePostSaveCallback(ctx: Context): Promise<boolean> {
     return true;
   }
 
-  const mv = moveMatch![1]!;
-  const newStatus: Status = mv === 'today' ? 'today' : mv === 'doing' ? 'in_progress' : 'done';
-  await pool.query(
-    `UPDATE cards SET status = $2::card_status, updated_at = NOW() WHERE id = $1`,
-    [cardId, newStatus],
-  );
-  await logActivity(appUserId, cardId, `telegram.move.${newStatus}`);
-  const card = (await loadCard(cardId))!;
+  const action = workflowMatch![1]!;
+  const targetStatus: Status = action === 'start' ? 'in_progress'
+    : action === 'test' ? 'ready_for_test'
+      : action === 'approve' ? 'ready_for_release' : 'needs_fix';
+  const currentCard = await loadCard(cardId);
+  if (currentCard && !(await hasTelegramWorkflowTopic(targetStatus, currentCard.work_type))) {
+    await ctx.answerCallbackQuery({
+      text: `Bind the ${STATUS_LABEL[targetStatus]} topic first.`,
+      show_alert: true,
+    });
+    return true;
+  }
+  const card = action === 'start'
+    ? await transitionCard(cardId, appUserId, 'in_progress')
+    : action === 'test'
+      ? await transitionCard(cardId, appUserId, 'ready_for_test')
+      : await recordPeerTest(cardId, appUserId, action === 'approve');
+  const newStatus = card.status;
+  const badge = `${STATUS_EMOJI[newStatus]} ${STATUS_LABEL[newStatus]}`;
   broadcast({ type: 'card.updated', card });
-
-  const badge = mv === 'today' ? '📅 Today' : mv === 'doing' ? '⚡ In Progress' : '✅ Done';
+  await projectCardToTopic(card.id);
   try {
     const current = ctx.callbackQuery!.message?.text ?? '';
     // Replace any existing "✓ Saved · …" badge line with the new one; fall back to prepend.
@@ -1247,9 +1806,7 @@ async function finalizeCardWithLink(
   pending: PendingProposal,
   noteText: string | null,
 ): Promise<void> {
-  const status: Status = pending.destination === 'private_card' || pending.destination === 'public_card'
-    ? 'today'
-    : 'backlog';
+  const status: Status = 'inbox';
   if (pending.destination === 'knowledge') {
     await ctx.reply('Linking is only available for card destinations. Pick Private or Public first.');
     deletePending(pending.id);
@@ -1268,6 +1825,7 @@ async function finalizeCardWithLink(
     createdBy: pending.appUserId,
     source: 'telegram',
     status,
+    workType: pending.taskWorkType ?? 'chore',
     aiSummarized: true,
     assignees: pending.destination === 'private_card' ? [pending.appUserId] : undefined,
     telegramChatId: pending.chatId,
@@ -1286,7 +1844,14 @@ async function finalizeCardWithLink(
     // Non-fatal — card is saved even if link fails
   }
 
-  await logActivity(pending.appUserId, cardId, `telegram.${pending.destination}.linked`);
+  await logActivity(
+    pending.appUserId,
+    cardId,
+    pending.taskSourceMessageId !== undefined
+      ? `telegram.task.${pending.destination}.linked`
+      : `telegram.${pending.destination}.linked`,
+    taskContextDetails(pending),
+  );
   deletePending(pending.id);
 
   const target = await loadCard(pending.pendingLinkTargetId);
@@ -1300,6 +1865,7 @@ async function finalizeCardWithLink(
   );
   if (card) {
     broadcast({ type: 'card.created', card });
+    if (pending.taskSourceMessageId !== undefined) await projectCardToTopic(cardId);
   }
 }
 
@@ -1454,7 +2020,7 @@ export function buildBot(token: string): Bot {
     } catch { /* edit non-fatal */ }
   });
 
-  bot.callbackQuery(/^col:(backlog|today|in_progress|done):([^:]+)$/, async (ctx) => {
+  bot.callbackQuery(/^col:(inbox):([^:]+)$/, async (ctx) => {
     const status = ctx.match![1] as Status;
     const pid = ctx.match![2]!;
     const pending = getPending(pid);
@@ -1764,15 +2330,7 @@ export function buildBot(token: string): Bot {
     try {
       const card = await loadCard(cardId);
       if (card) {
-        const kb = new InlineKeyboard();
-        const row: Array<[string, Status, string]> = [
-          ['📅 Today', 'today', `mv:today:${cardId}`],
-          ['⚡ Doing', 'in_progress', `mv:doing:${cardId}`],
-          ['✅ Done', 'done', `mv:done:${cardId}`],
-        ];
-        for (const [label, s, cb] of row) if (s !== card.status) kb.text(label, cb);
-        kb.text('🗑', `arch:${cardId}`);
-        await ctx.editMessageReplyMarkup({ reply_markup: kb });
+        await ctx.editMessageReplyMarkup({ reply_markup: postSaveKeyboard(cardId, card.status) });
       }
     } catch { /* edit non-fatal */ }
     await ctx.reply('✓ Research queued — open card for results when ready.');
@@ -1804,6 +2362,12 @@ export function buildBot(token: string): Bot {
     } catch (e) {
       // Never drop user input silently: save a card with raw body if possible.
       const raw = ctx.msg?.text ?? ctx.msg?.caption ?? '[telegram message — handler error]';
+      const failedCommand = parseCommand(raw).command;
+      if (failedCommand === 'task' || failedCommand === 'remember' || failedCommand === 'forget') {
+        console.error('[telegram] command failed; not creating a fallback card:', e);
+        await ctx.reply('The command failed. If this was /task, check the board before retrying.');
+        return;
+      }
       const { tags, text: clean } = extractHashtags(raw);
       const cardId = await createCard({
         title: splitTitleDesc(clean).title || '[telegram error]',
@@ -1838,6 +2402,13 @@ export async function startTelegramBot(): Promise<void> {
   if (!token) return;
   if (botInstance) return;
   botInstance = buildBot(token);
+  if (!projectionTimer) {
+    projectionTimer = setInterval(() => {
+      flushProjectionOutbox().catch((error) => console.error('[telegram] projection retry failed:', error));
+    }, 30_000);
+    projectionTimer.unref();
+    flushProjectionOutbox().catch((error) => console.error('[telegram] projection retry failed:', error));
+  }
 
   // Webhook mode if a URL is configured, otherwise long polling as dev fallback.
   const webhookUrl = process.env.TELEGRAM_WEBHOOK_URL;
