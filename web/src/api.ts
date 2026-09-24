@@ -36,8 +36,6 @@ const json = (body: unknown): RequestInit => ({
 
 export const api = {
   me: () => req<User>('/api/auth/me'),
-  register: (b: { name: string; short_name: string; email: string; password: string }) =>
-    req<User>('/api/auth/register', json(b)),
   login: (b: { email: string; password: string }) => req<User>('/api/auth/login', json(b)),
   logout: () => req<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
   updateMe: (b: { short_name?: string; name?: string }) =>

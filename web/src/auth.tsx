@@ -6,7 +6,6 @@ type Ctx = {
   user: User | null;
   loading: boolean;
   login: (email: string, password: string) => Promise<void>;
-  register: (name: string, short_name: string, email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
   updateMe: (patch: { short_name?: string; name?: string }) => Promise<void>;
 };
@@ -31,8 +30,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     user,
     loading,
     login: async (email, password) => setUser(await api.login({ email, password })),
-    register: async (name, short_name, email, password) =>
-      setUser(await api.register({ name, short_name, email, password })),
     logout: async () => {
       await api.logout();
       setUser(null);

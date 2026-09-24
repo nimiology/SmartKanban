@@ -22,6 +22,9 @@ export async function authRoutes(app: FastifyInstance) {
   app.post<{ Body: { name: string; short_name: string; email: string; password: string } }>(
     '/api/auth/register',
     async (req, reply) => {
+      if (!OPEN_SIGNUP) {
+        return reply.code(403).send({ error: 'signup disabled' });
+      }
       const { name, short_name, email, password } = req.body ?? {};
       if (!name || !short_name || !email || !password || password.length < 6) {
         return reply
@@ -40,10 +43,11 @@ export async function authRoutes(app: FastifyInstance) {
         await client.query('BEGIN');
         await client.query(`SELECT pg_advisory_xact_lock(hashtext('first_user_bootstrap'))`);
 
-        // Re-check OPEN_SIGNUP gate inside the lock (count is now stable).
+        // Re-check the gate inside the lock in case configuration is changed
+        // while this request is in flight.
         const { rows: existing } = await client.query<{ c: string }>(`SELECT COUNT(*)::text c FROM users`);
         const userCount = Number(existing[0]!.c);
-        if (userCount > 0 && !OPEN_SIGNUP) {
+        if (!OPEN_SIGNUP) {
           await client.query('ROLLBACK');
           return reply.code(403).send({ error: 'signup disabled' });
         }

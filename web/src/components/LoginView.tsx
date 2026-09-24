@@ -17,10 +17,7 @@ function isSafeRelativePath(p: string | undefined): boolean {
 }
 
 export function LoginView({ redirectTo }: Props) {
-  const { login, register } = useAuth();
-  const [mode, setMode] = useState<'login' | 'register'>('login');
-  const [name, setName] = useState('');
-  const [shortName, setShortName] = useState('');
+  const { login } = useAuth();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -40,16 +37,9 @@ export function LoginView({ redirectTo }: Props) {
     setError(null);
     setBusy(true);
     try {
-      if (mode === 'login') {
-        await login(email, password);
-        if (isSafeRelativePath(redirectTo)) {
-          location.assign(redirectTo!);
-        }
-      } else {
-        await register(name, shortName, email, password);
-        if (isSafeRelativePath(redirectTo)) {
-          location.assign(redirectTo!);
-        }
+      await login(email, password);
+      if (isSafeRelativePath(redirectTo)) {
+        location.assign(redirectTo!);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'failed');
@@ -113,7 +103,7 @@ export function LoginView({ redirectTo }: Props) {
               marginTop: 2, fontFamily: 'JetBrains Mono, monospace',
               fontSize: 11, color: 'rgb(var(--ink-3))', letterSpacing: '0.04em',
             }}>
-              {mode === 'login' ? 'SIGN IN' : 'CREATE ACCOUNT'}
+              SIGN IN
             </div>
           </div>
         </div>
@@ -137,31 +127,13 @@ export function LoginView({ redirectTo }: Props) {
         )}
 
         <form onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-          {mode === 'register' && (
-            <>
-              <LoginInput
-                value={name}
-                onChange={setName}
-                placeholder="Your name"
-                required
-              />
-              <LoginInput
-                value={shortName}
-                onChange={(v) => setShortName(v.slice(0, 16))}
-                placeholder="Short name shown on cards (e.g. Jay)"
-                required
-                minLength={1}
-                maxLength={16}
-              />
-            </>
-          )}
           <LoginInput
             type="email"
             value={email}
             onChange={setEmail}
             placeholder="Email"
             required
-            autoComplete={mode === 'login' ? 'username' : 'email'}
+            autoComplete="username"
           />
           <LoginInput
             type="password"
@@ -170,7 +142,7 @@ export function LoginView({ redirectTo }: Props) {
             placeholder="Password"
             required
             minLength={6}
-            autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+            autoComplete="current-password"
           />
 
           {error && (
@@ -199,28 +171,9 @@ export function LoginView({ redirectTo }: Props) {
               transition: 'background 150ms ease',
             }}
           >
-            {busy ? 'Working…' : mode === 'login' ? 'Sign in' : 'Create account'}
+            {busy ? 'Working…' : 'Sign in'}
           </button>
         </form>
-
-        <button
-          type="button"
-          onClick={() => {
-            setMode(mode === 'login' ? 'register' : 'login');
-            setError(null);
-          }}
-          style={{
-            display: 'block', width: '100%',
-            marginTop: 18, padding: '8px 0',
-            background: 'none', border: 'none', cursor: 'pointer',
-            fontSize: 13, color: 'rgb(var(--ink-3))', fontFamily: 'Inter, sans-serif',
-            textAlign: 'center',
-          }}
-        >
-          {mode === 'login'
-            ? "No account yet? Register"
-            : 'Already have an account? Sign in'}
-        </button>
       </div>
     </div>
   );
