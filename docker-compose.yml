@@ -25,7 +25,7 @@ services:
       ATTACHMENTS_DIR: /app/server/data/attachments
       PORT: "3001"
     ports:
-      - "3001:3001"
+      - "127.0.0.1:7301:3001"
     volumes:
       - ./server/data:/app/server/data
     depends_on:

@@ -187,7 +187,7 @@ Hit `Ctrl-C` to stop tailing logs (the container keeps running).
 Smoke test from the VPS:
 
 ```bash
-curl -s http://localhost:3001/health
+curl -s http://localhost:7301/health
 # → {"ok":true}
 ```
 
@@ -214,7 +214,7 @@ Replace `/etc/caddy/Caddyfile` with:
 ```
 kanban.example.com {
     encode zstd gzip
-    reverse_proxy localhost:3001 {
+    reverse_proxy localhost:7301 {
         # WebSocket upgrade is handled automatically by Caddy
     }
 }
@@ -436,7 +436,7 @@ server {
     server_name kanban.example.com;
 
     location / {
-        proxy_pass http://localhost:3001;
+        proxy_pass http://localhost:7301;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
