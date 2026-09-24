@@ -27,6 +27,12 @@ export type PendingProposal = {
   promptMessageId: number | null;
   awaitingEdit: boolean;
   awaitingLinks: boolean;
+  awaitingManual?: boolean;
+  correction?: string;
+  manualText?: string;
+  captureType?: 'text' | 'photo' | 'voice';
+  captureMessageId?: number;
+  aiSummarized?: boolean;
   createdAt: number;
   // Structured-capture extensions
   destination?: Destination;
@@ -81,6 +87,12 @@ export function createPending(
     | 'pendingLinkTargetId'
     | 'pendingLinkLabel'
     | 'awaitingLinkNote'
+    | 'awaitingManual'
+    | 'correction'
+    | 'manualText'
+    | 'captureType'
+    | 'captureMessageId'
+    | 'aiSummarized'
   >,
 ): PendingProposal {
   prune();

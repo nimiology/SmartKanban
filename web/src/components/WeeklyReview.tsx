@@ -8,6 +8,7 @@ export function WeeklyReview({ onClose }: Props) {
   const [data, setData] = useState<ReviewData | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [summaryLoading, setSummaryLoading] = useState(false);
 
   const load = () => {
     setErr(null);
@@ -18,6 +19,19 @@ export function WeeklyReview({ onClose }: Props) {
   useEffect(() => {
     load();
   }, []);
+
+  const generateSummary = async () => {
+    setErr(null);
+    setSummaryLoading(true);
+    try {
+      const result = await api.reviewSummary();
+      setData((current) => current ? { ...current, summary: result.summary } : current);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setSummaryLoading(false);
+    }
+  };
 
   const stats = data
     ? [
@@ -55,6 +69,9 @@ export function WeeklyReview({ onClose }: Props) {
         {/* Body */}
         <div className="p-6 flex flex-col gap-6">
           {err && <div className="text-1 tracking-tight2 text-red">{err}</div>}
+          <p className="text-1 tracking-tight2 text-ink-soft">
+            The review loads without AI. Tap the button below if you want an OpenAI summary.
+          </p>
           {!data && !err && (
             <div className="text-3 tracking-tight2 text-ink-soft">Loading…</div>
           )}
@@ -94,11 +111,11 @@ export function WeeklyReview({ onClose }: Props) {
         <div className="px-6 py-4 border-t border-ink/6 flex justify-end gap-3 shrink-0">
           <button
             type="button"
-            onClick={load}
-            disabled={loading}
+            onClick={generateSummary}
+            disabled={loading || summaryLoading || !data}
             className="btn-pill btn-pill-outlined-green disabled:opacity-50"
           >
-            {loading ? 'Generating…' : 'Generate again'}
+            {summaryLoading ? 'Asking OpenAI…' : data?.summary ? 'Generate again with OpenAI' : 'Generate AI summary'}
           </button>
           <button type="button" onClick={onClose} className="btn-pill btn-pill-filled-green">
             Got it

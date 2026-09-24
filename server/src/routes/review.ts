@@ -12,11 +12,9 @@ type ReviewRow = {
   tags: string[];
 };
 
-export async function reviewRoutes(app: FastifyInstance) {
-  app.get('/api/review', { preHandler: requireUser }, async (req) => {
-    const userId = req.user!.id;
-
-    const done = await pool.query<ReviewRow>(
+async function loadReviewRows(userId: string) {
+  const [done, stale, stuck] = await Promise.all([
+    pool.query<ReviewRow>(
       `SELECT c.id, c.title, c.status, c.updated_at, c.created_at, c.tags
        FROM cards c
        WHERE NOT c.archived AND c.status = 'released' AND c.updated_at > NOW() - INTERVAL '7 days'
@@ -24,9 +22,8 @@ export async function reviewRoutes(app: FastifyInstance) {
               OR EXISTS (SELECT 1 FROM card_assignees WHERE card_id = c.id AND user_id = $1))
        ORDER BY c.updated_at DESC`,
       [userId],
-    );
-
-    const stale = await pool.query<ReviewRow>(
+    ),
+    pool.query<ReviewRow>(
       `SELECT c.id, c.title, c.status, c.updated_at, c.created_at, c.tags
        FROM cards c
        WHERE NOT c.archived AND c.status IN ('inbox', 'in_progress', 'ready_for_test', 'needs_fix', 'ready_for_release')
@@ -35,9 +32,8 @@ export async function reviewRoutes(app: FastifyInstance) {
               OR EXISTS (SELECT 1 FROM card_assignees WHERE card_id = c.id AND user_id = $1))
        ORDER BY c.updated_at ASC`,
       [userId],
-    );
-
-    const stuck = await pool.query<ReviewRow>(
+    ),
+    pool.query<ReviewRow>(
       `SELECT c.id, c.title, c.status, c.updated_at, c.created_at, c.tags
        FROM cards c
        WHERE NOT c.archived AND c.status = 'in_progress'
@@ -46,15 +42,20 @@ export async function reviewRoutes(app: FastifyInstance) {
               OR EXISTS (SELECT 1 FROM card_assignees WHERE card_id = c.id AND user_id = $1))
        ORDER BY c.updated_at ASC`,
       [userId],
-    );
+    ),
+  ]);
+  return { done: done.rows, stale: stale.rows, stuck: stuck.rows };
+}
 
-    const summary = await maybeWeeklySummary(done.rows, stale.rows, stuck.rows);
+export async function reviewRoutes(app: FastifyInstance) {
+  app.get('/api/review', { preHandler: requireUser }, async (req) => {
+    const userId = req.user!.id;
+    return { ...(await loadReviewRows(userId)), summary: null };
+  });
 
-    return {
-      done: done.rows,
-      stale: stale.rows,
-      stuck: stuck.rows,
-      summary,
-    };
+  app.post('/api/review/summary', { preHandler: requireUser }, async (req) => {
+    const rows = await loadReviewRows(req.user!.id);
+    const summary = await maybeWeeklySummary(rows.done, rows.stale, rows.stuck);
+    return { summary };
   });
 }

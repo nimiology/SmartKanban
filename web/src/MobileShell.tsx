@@ -481,7 +481,8 @@ export function MobileShell({ meId }: { meId: string }) {
             }}
             onCreateFromImage={async (file, status) => {
               try {
-                const created = await api.createCardFromImage(file, status);
+                const useAI = window.confirm('Send this image to OpenAI for a suggested task title and description? Choose Cancel to create the card manually.');
+                const created = await api.createCardFromImage(file, status, useAI);
                 setCards((prev) => prev.some((c) => c.id === created.id) ? prev : [...prev, created]);
                 addToast(`Photo card in ${STATUS_LABELS[status]}`, 'success');
               } catch (err) {

@@ -490,12 +490,89 @@ function destinationKeyboard(
     kb.text(`${o.key === def ? '✓ ' : ''}${o.label}`, `dest:${o.key}:${pid}`);
   }
   kb.row()
-    .text('🔍 Check duplicates?', `dup:check:${pid}`)
+    .text('🤖 Check duplicates with AI', `dup:check:${pid}`)
     .text('🔗 Link to existing', `linkpick:${pid}`);
   kb.row()
     .text('✏️ Edit', `edit:${pid}`)
     .text('❌ Cancel', `drop:${pid}`);
   return kb;
+}
+
+function captureChoiceKeyboard(pid: string, mediaLabel?: string): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  if (AI_ENABLED()) {
+    kb.text(mediaLabel ? `🤖 ${mediaLabel} with OpenAI` : '🤖 Draft with OpenAI', `capture:ai:${pid}`);
+  }
+  kb.text(mediaLabel ? '✍️ Enter task manually' : '✍️ Save my text as task', `capture:manual:${pid}`)
+    .row()
+    .text('❌ Cancel', `drop:${pid}`);
+  return kb;
+}
+
+function correctionChoiceKeyboard(pid: string): InlineKeyboard {
+  return new InlineKeyboard()
+    .text('🤖 Apply with OpenAI', `capture:edit-ai:${pid}`)
+    .text('✍️ Use correction as written', `capture:edit-manual:${pid}`)
+    .row()
+    .text('❌ Cancel', `drop:${pid}`);
+}
+
+function plainProposal(text: string, fallbackTitle = 'New task'): AIProposal {
+  const { tags, text: clean } = extractHashtags(text);
+  const { title, description } = splitTitleDesc(clean);
+  return {
+    is_actionable: true,
+    title: (title || fallbackTitle).slice(0, 120),
+    description,
+    tags: tags.slice(0, 3),
+    reason: 'created from user-provided text without AI',
+  };
+}
+
+async function sendCaptureChoice(
+  ctx: Context,
+  pending: PendingProposal,
+  prompt: string,
+  mediaLabel?: string,
+): Promise<void> {
+  const aiConfigured = AI_ENABLED();
+  const message = await ctx.reply(
+    `${prompt}\n\n${aiConfigured
+      ? 'I will only send this content to OpenAI if you choose the OpenAI button.'
+      : 'OpenAI is not configured here; no AI call will be made.'}`,
+    { reply_markup: captureChoiceKeyboard(pending.id, mediaLabel) },
+  );
+  updatePending(pending.id, { promptMessageId: message.message_id });
+}
+
+function helpText(): string {
+  return [
+    'I ignore normal group conversation. Mention me, use a command, or reply to one of my active prompts.',
+    '',
+    'Create tasks',
+    '• Mention me with a task: `@bot Add dark mode`',
+    '• Reply to a message with `/task [instruction]`',
+    '• Choose “Draft with OpenAI” or “Save my text as task” — I do not call OpenAI unless you tap its button.',
+    '• Send me a task in a private chat to get the same choices.',
+    '• `/today <task>` saves the text directly without AI.',
+    '',
+    'Remember topic context',
+    '• Reply to a message with `/remember [note]` or `/forget`.',
+    '',
+    'Task workflow (reply to a task card)',
+    '• `/start`, `/test`, `/approve`, `/fail [notes]`',
+    '• `/topics status` shows topic bindings; admins can use `/topics bind <route>` inside a topic.',
+    '• `/assign @user` and `/share @user` update a task.',
+    '• Admins: `/release <version> <commit-sha> <pass|fail> [notes]`, then `/done <version> <commit-sha> <pass|fail> [notes]`.',
+    '',
+    'Knowledge and templates (private chat)',
+    '• `/save <url> | <title>`, `/note <title> | <body>`, `/k <query>`, `/klist`.',
+    '• `/templates` lists templates; `/use <template>` creates one.',
+    '',
+    'Other',
+    '• `/help` shows this guide.',
+    '• AI brainstorm and duplicate checks run only when you tap their clearly labeled AI buttons. Use `@ai` in a card discussion when you want an AI reply.',
+  ].join('\n');
 }
 
 function columnKeyboard(pid: string): InlineKeyboard {
@@ -547,7 +624,7 @@ function postSaveKeyboard(cardId: string, currentStatus: Status): InlineKeyboard
     kb.text('✅ Approve', `wf:approve:${cardId}`).text('🛠️ Needs fix', `wf:fail:${cardId}`);
   }
   kb.text('🗑', `arch:${cardId}`);
-  kb.row().text('🤔 Brainstorm', `brain:${cardId}`);
+  kb.row().text('🤖 AI brainstorm', `brain:${cardId}`);
   return kb;
 }
 
@@ -595,31 +672,38 @@ async function handleText(
   const { command, rest } = parseCommand(text);
   const body = command ? rest : text;
 
+  if (command === 'help') {
+    await ctx.reply(helpText());
+    return;
+  }
+
   // If the user has a pending proposal awaiting a correction or a link,
   // route this message accordingly and re-show the updated proposal.
   const tgUserId = ctx.from?.id;
   if (tgUserId && !command) {
     const existing = getLatestForUser(tgUserId);
-    if (existing && existing.awaitingEdit) {
-      const revised = await proposeFromText(
-        existing.original,
-        existing.proposal,
-        text,
-        existing.contextSnippets,
-      );
-      if (revised) {
-        updatePending(existing.id, { proposal: revised, awaitingEdit: false });
-        const msgId = await sendProposal(
-          ctx,
-          existing.id,
-          revised,
-          existing.isPrivateChat,
-          existing.links,
+    if (existing?.awaitingManual) {
+      const proposal = plainProposal(text, existing.captureType === 'photo' ? 'Photo task' : existing.captureType === 'voice' ? 'Voice task' : 'New task');
+      updatePending(existing.id, { proposal, manualText: text, awaitingManual: false, aiSummarized: false });
+      if (existing.captureType === 'photo' || existing.captureType === 'voice') {
+        const message = await ctx.reply(
+          `✍️ Manual task details saved: ${proposal.title}\n\nCreate a new task or attach this file to an existing task?`,
+          { reply_markup: attachmentKindKeyboard(existing.id) },
         );
-        updatePending(existing.id, { promptMessageId: msgId });
+        updatePending(existing.id, { promptMessageId: message.message_id });
       } else {
-        await ctx.reply('Could not update — try again with a clearer correction.');
+        const messageId = await sendProposal(ctx, existing.id, proposal, existing.isPrivateChat);
+        updatePending(existing.id, { promptMessageId: messageId });
       }
+      return;
+    }
+    if (existing && existing.awaitingEdit) {
+      updatePending(existing.id, { awaitingEdit: false, correction: text });
+      const message = await ctx.reply(
+        'Correction received. Choose whether to apply it with OpenAI or use it as written.',
+        { reply_markup: correctionChoiceKeyboard(existing.id) },
+      );
+      updatePending(existing.id, { promptMessageId: message.message_id });
       return;
     }
     if (existing && existing.awaitingLinks) {
@@ -925,73 +1009,24 @@ async function handleText(
       `Replied-to message: ${sourceText}`,
     ].join('\n');
     const threadId = source.message_thread_id ?? ctx.msg?.message_thread_id ?? 0;
-    let remembered = [] as Awaited<ReturnType<typeof searchRememberedContext>>;
-    if (AI_ENABLED()) {
-      try {
-        remembered = await searchRememberedContext(
-          chatId,
-          threadId,
-          `${instruction} ${sourceText}`,
-        );
-      } catch (error) {
-        console.error('[telegram] remembered-context search failed:', error);
-        await ctx.reply('Remembered context is temporarily unavailable; continuing with the replied-to message only.');
-      }
-    }
-    const contextSnippets = rememberedContextForPrompt(remembered);
-    if (AI_ENABLED() && ctx.from?.id !== undefined) {
-      const proposal = await proposeFromText(original, undefined, undefined, contextSnippets);
-      if (proposal) {
-        const pending = createPending({
-          tgUserId: ctx.from.id,
-          appUserId: createdBy,
-          chatId,
-          isPrivateChat: false,
-          original,
-          proposal,
-        });
-        updatePending(pending.id, {
-          contextSnippets,
-          contextMessageIds: remembered.map((item) => item.message_id),
-          taskSourceMessageId: source.message_id,
-          taskSourceThreadId: threadId,
-          taskWorkType: guessedType,
-        });
-        const lines = remembered.slice(0, 4).map((item) =>
-          `• #${item.message_id}: ${item.body.replace(/\s+/g, ' ').slice(0, 140)}`,
-        );
-        await ctx.reply(remembered.length
-          ? `🔎 Remembered context used from this topic:\n${lines.join('\n')}`
-          : 'ℹ️ No matching remembered messages in this topic; using only your reply and instruction.');
-        const links = extractUrls(sourceText);
-        const promptMessageId = await sendProposal(ctx, pending.id, proposal, false, links);
-        updatePending(pending.id, { promptMessageId });
-        return;
-      }
-    }
-
-    const { title, description } = splitTitleDesc(sourceText);
-    const cardId = await createCard({
-      title,
-      description: [description, instruction ? `Instruction: ${instruction}` : ''].filter(Boolean).join('\n\n'),
-      createdBy,
-      source: 'telegram',
-      status: 'inbox',
-      workType: guessedType,
-      telegramChatId: chatId,
-      telegramMessageId: ctx.msg?.message_id,
+    const manualText = [instruction, sourceText].filter(Boolean).join('\n\n');
+    const pending = createPending({
+      tgUserId: ctx.from!.id,
+      appUserId: createdBy,
+      chatId,
+      isPrivateChat: false,
+      original,
+      proposal: plainProposal(manualText),
     });
-    await logActivity(createdBy, cardId, 'telegram.task', {
-      source_message_id: source.message_id,
-      source_thread_id: threadId,
-      remembered_context_message_ids: remembered.map((item) => item.message_id),
+    updatePending(pending.id, {
+      captureType: 'text',
+      manualText,
+      captureMessageId: ctx.msg?.message_id,
+      taskSourceMessageId: source.message_id,
+      taskSourceThreadId: threadId,
+      taskWorkType: guessedType,
     });
-    const card = await loadCard(cardId);
-    if (card) broadcast({ type: 'card.created', card });
-    await projectCardToTopic(cardId);
-    await ctx.reply(`✓ Saved · ${STATUS_EMOJI.inbox} ${STATUS_LABEL.inbox} — ${title}`, {
-      reply_markup: postSaveKeyboard(cardId, 'inbox'),
-    });
+    await sendCaptureChoice(ctx, pending, 'Task request is ready. Draft it with AI, or save your text as the task. The AI option may also include matching messages you explicitly saved with /remember in this topic.');
     return;
   }
 
@@ -1116,170 +1151,180 @@ async function handleText(
     return;
   }
 
-  // Interactive propose/confirm flow for all other text.
-  if (AI_ENABLED() && tgUserId !== undefined && chatId !== undefined) {
-    const seed = (command ? rest : text) || text;
-    const proposal = await proposeFromText(seed);
-    if (proposal) {
-      const seededLinks = extractUrls(text);
-      const pending = createPending({
-        tgUserId,
-        appUserId: createdBy,
-        chatId,
-        isPrivateChat: isPrivate,
-        original: text,
-        proposal,
-      });
-      if (seededLinks.length) {
-        updatePending(pending.id, { links: seededLinks });
-      }
-      const msgId = await sendProposal(ctx, pending.id, proposal, isPrivate, seededLinks);
-      updatePending(pending.id, { promptMessageId: msgId });
-      return;
-    }
+  // Text capture is opt-in for AI. Keep the user's original text as the
+  // manual draft so choosing the manual path never contacts OpenAI.
+  if (tgUserId === undefined || chatId === undefined) return;
+  const manualText = (command ? rest : text) || text;
+  if (!manualText.trim()) {
+    await ctx.reply('Please include the task details after mentioning me. Use /help for examples.');
+    return;
   }
-
-  // Fallback (no AI key or proposal failed): preserve the original auto-save behavior.
-  const { title, description } = splitTitleDesc(clean);
-  if (!title) return;
-  const cardId = await createCard({
-    title,
-    description,
-    tags,
-    createdBy,
-    source: 'telegram',
-      status: 'inbox',
-    telegramChatId: chatId,
-    telegramMessageId: ctx.msg?.message_id,
-    assignees: isPrivate ? [createdBy] : undefined,
+  const pending = createPending({
+    tgUserId,
+    appUserId: createdBy,
+    chatId,
+    isPrivateChat: isPrivate,
+    original: manualText,
+    proposal: plainProposal(manualText),
   });
-  await logActivity(createdBy, cardId, isPrivate ? 'telegram.text.private' : 'telegram.text');
-  const card = (await loadCard(cardId))!;
-  broadcast({ type: 'card.created', card });
-  await reactOk(ctx);
+  const seededLinks = extractUrls(manualText);
+  updatePending(pending.id, {
+    captureType: 'text',
+    manualText,
+    captureMessageId: ctx.msg?.message_id,
+    links: seededLinks,
+  });
+  await sendCaptureChoice(ctx, pending, 'Choose how to save this task.');
 }
 
-async function handleVoice(ctx: Context, appUserId: string, isPrivate = false): Promise<void> {
+async function handleVoice(
+  ctx: Context,
+  appUserId: string,
+  isPrivate = false,
+  caption = '',
+): Promise<void> {
   const voice = ctx.msg?.voice ?? ctx.msg?.audio;
-  if (!voice) return;
-  const voiceFileId = voice.file_id;
-  const tmpCardId = crypto.randomUUID();
-  const bot = getBot()!;
-  const audioPath = await downloadTelegramFile(bot, voiceFileId, tmpCardId, '.ogg');
-
-  const transcript = await transcribeAudio(audioPath);
-
-  // Clean up temp file — it will be re-downloaded when attached to a card.
-  await fs.unlink(audioPath).catch(() => {});
-  await fs.rmdir(path.dirname(audioPath)).catch(() => {});
-
-  let title: string;
-  let description = '';
-  let needsReview = false;
-
-  if (transcript && transcript.length > 0) {
-    const split = splitTitleDesc(transcript);
-    title = split.title;
-    description = split.description;
-  } else {
-    title = '[voice note — transcription failed]';
-    needsReview = true;
-  }
-
-  const proposal: AIProposal = {
-    is_actionable: !needsReview,
-    title,
-    description: description || '',
-    tags: transcript ? extractHashtags(transcript).tags : [],
-    reason: needsReview ? 'voice note without transcript' : 'voice note with Whisper transcript',
-  };
-
-  const chatId = ctx.chat!.id;
+  const chatId = ctx.chat?.id;
+  if (!voice || chatId === undefined || ctx.from?.id === undefined) return;
+  const manualText = caption.trim();
   const pending = createPending({
-    tgUserId: ctx.from!.id,
+    tgUserId: ctx.from.id,
     appUserId,
     chatId,
     isPrivateChat: isPrivate,
-    original: transcript || title,
-    proposal,
+    original: manualText || 'Voice note task',
+    proposal: plainProposal(manualText, 'Voice note task'),
   });
   updatePending(pending.id, {
-    pendingAudioFileId: voiceFileId,
+    captureType: 'voice',
+    captureMessageId: ctx.msg?.message_id,
+    manualText,
+    pendingAudioFileId: voice.file_id,
     attachMode: 'new',
   });
-
-  await reactOk(ctx, transcript ? '👍' : '🤔');
-  await ctx.reply(
-    `🎙 ${title}${description ? '\n\n' + description.slice(0, 300) : ''}\n\nIs this new, or attaching to existing?`,
-    {
-      reply_markup: attachmentKindKeyboard(pending.id),
-      reply_parameters: { message_id: ctx.msg!.message_id, allow_sending_without_reply: true },
-    },
+  await sendCaptureChoice(
+    ctx,
+    pending,
+    'Voice note received. You can ask OpenAI to transcribe it, or enter the task details yourself.',
+    'Transcribe audio',
   );
 }
 
-async function handlePhoto(ctx: Context, appUserId: string, isPrivate = false): Promise<void> {
+async function handlePhoto(
+  ctx: Context,
+  appUserId: string,
+  isPrivate = false,
+  caption = '',
+): Promise<void> {
   const photos = ctx.msg?.photo;
-  if (!photos || photos.length === 0) return;
-  const largest = photos[photos.length - 1]!;
-  const photoFileId = largest.file_id;
-  const tmpCardId = crypto.randomUUID();
-  const bot = getBot()!;
-  const imagePath = await downloadTelegramFile(bot, photoFileId, tmpCardId, '.jpg');
-
-  const caption = ctx.msg?.caption ?? '';
-  const captionTags = extractHashtags(caption).tags;
-
-  const vision = await summarizeImage(imagePath);
-  let title: string;
-  let description = '';
-  let needsReview = false;
-
-  if (vision) {
-    title = vision.title;
-    description = vision.description + (caption ? '\n\n' + caption : '');
-  } else if (caption.trim()) {
-    const split = splitTitleDesc(extractHashtags(caption).text);
-    title = split.title;
-    description = split.description;
-  } else {
-    title = '[photo — needs review]';
-    needsReview = true;
-  }
-
-  // Clean up temp file — it will be re-downloaded when attached to a card.
-  await fs.unlink(imagePath).catch(() => {});
-  await fs.rmdir(path.dirname(imagePath)).catch(() => {});
-
-  const proposal: AIProposal = {
-    is_actionable: !needsReview,
-    title,
-    description: description || '',
-    tags: captionTags,
-    reason: needsReview ? 'photo without caption or vision summary' : 'photo with AI vision summary',
-  };
-
-  const chatId = ctx.chat!.id;
+  const chatId = ctx.chat?.id;
+  if (!photos?.length || chatId === undefined || ctx.from?.id === undefined) return;
+  const manualText = caption.trim();
   const pending = createPending({
-    tgUserId: ctx.from!.id,
+    tgUserId: ctx.from.id,
     appUserId,
     chatId,
     isPrivateChat: isPrivate,
-    original: title,
-    proposal,
+    original: manualText || 'Photo task',
+    proposal: plainProposal(manualText, 'Photo task'),
   });
   updatePending(pending.id, {
-    pendingPhotoFileId: photoFileId,
+    captureType: 'photo',
+    captureMessageId: ctx.msg?.message_id,
+    manualText,
+    pendingPhotoFileId: photos[photos.length - 1]!.file_id,
     attachMode: 'new',
   });
-
-  await ctx.reply(
-    `📷 ${title}${description ? '\n\n' + description : ''}\n\nIs this new, or attaching to existing?`,
-    {
-      reply_markup: attachmentKindKeyboard(pending.id),
-      reply_parameters: { message_id: ctx.msg!.message_id, allow_sending_without_reply: true },
-    },
+  await sendCaptureChoice(
+    ctx,
+    pending,
+    'Image received. You can ask OpenAI to describe it, or enter the task details yourself.',
+    'Analyze image',
   );
+}
+
+async function sendMediaAttachmentChoice(ctx: Context, pending: PendingProposal): Promise<void> {
+  const icon = pending.captureType === 'photo' ? '📷' : '🎙';
+  const message = await ctx.reply(
+    `${icon} ${pending.proposal.title}${pending.proposal.description ? `\n\n${pending.proposal.description}` : ''}\n\nCreate a new task or attach this file to an existing task?`,
+    { reply_markup: attachmentKindKeyboard(pending.id) },
+  );
+  updatePending(pending.id, { promptMessageId: message.message_id });
+}
+
+async function captureWithAI(ctx: Context, pending: PendingProposal): Promise<void> {
+  if (!AI_ENABLED()) {
+    await ctx.reply('OpenAI is not configured. No task was created; use the manual option.');
+    return;
+  }
+
+  let proposal: AIProposal | null = null;
+  let usedAI = false;
+  try {
+    if (pending.captureType === 'photo' && pending.pendingPhotoFileId) {
+      const imagePath = await downloadTelegramFile(getBot()!, pending.pendingPhotoFileId, crypto.randomUUID(), '.jpg');
+      try {
+        const vision = await summarizeImage(imagePath);
+        if (vision) {
+          proposal = {
+            is_actionable: true,
+            title: vision.title,
+            description: [vision.description, pending.manualText].filter(Boolean).join('\n\n'),
+            tags: pending.manualText ? extractHashtags(pending.manualText).tags : [],
+            reason: 'user requested an OpenAI image summary',
+          };
+          usedAI = true;
+        }
+      } finally {
+        await fs.unlink(imagePath).catch(() => {});
+        await fs.rmdir(path.dirname(imagePath)).catch(() => {});
+      }
+    } else if (pending.captureType === 'voice' && pending.pendingAudioFileId) {
+      const audioPath = await downloadTelegramFile(getBot()!, pending.pendingAudioFileId, crypto.randomUUID(), '.ogg');
+      try {
+        const transcript = await transcribeAudio(audioPath);
+        if (transcript) {
+          proposal = plainProposal([pending.manualText, transcript].filter(Boolean).join('\n\n'), 'Voice task');
+          usedAI = true;
+          updatePending(pending.id, { original: transcript });
+        }
+      } finally {
+        await fs.unlink(audioPath).catch(() => {});
+        await fs.rmdir(path.dirname(audioPath)).catch(() => {});
+      }
+    } else {
+      let context: string[] = [];
+      if (pending.taskSourceMessageId !== undefined && pending.taskSourceThreadId !== undefined) {
+        try {
+          const remembered = await searchRememberedContext(
+            pending.chatId,
+            pending.taskSourceThreadId,
+            pending.manualText ?? pending.original,
+          );
+          context = rememberedContextForPrompt(remembered);
+          updatePending(pending.id, { contextSnippets: context, contextMessageIds: remembered.map((item) => item.message_id) });
+        } catch (error) {
+          console.error('[telegram] remembered-context search failed:', error);
+        }
+      }
+      proposal = await proposeFromText(pending.original, undefined, undefined, context);
+      usedAI = Boolean(proposal);
+    }
+  } catch (error) {
+    console.error('[telegram] requested AI task capture failed:', error);
+  }
+
+  if (!proposal) {
+    await ctx.reply('OpenAI could not prepare this task. Nothing was saved; use the manual option on the original prompt.');
+    return;
+  }
+  updatePending(pending.id, { proposal, aiSummarized: usedAI, awaitingManual: false });
+  if (pending.captureType === 'photo' || pending.captureType === 'voice') {
+    await sendMediaAttachmentChoice(ctx, pending);
+    return;
+  }
+  const messageId = await sendProposal(ctx, pending.id, proposal, pending.isPrivateChat, pending.links);
+  updatePending(pending.id, { promptMessageId: messageId });
 }
 
 // ---------- structured-capture helpers ----------
@@ -1336,10 +1381,10 @@ async function finalizeCard(
     source: 'telegram',
     status,
     workType: pending.taskWorkType ?? 'chore',
-    aiSummarized: true,
+    aiSummarized: pending.aiSummarized ?? false,
     assignees,
     telegramChatId: pending.chatId,
-    telegramMessageId: pending.promptMessageId ?? undefined,
+    telegramMessageId: pending.captureMessageId ?? pending.taskSourceMessageId ?? pending.promptMessageId ?? undefined,
   });
 
   // Attach any pending media (set by photo/voice handlers in Task 8/9)
@@ -1961,6 +2006,96 @@ export function buildBot(token: string): Bot {
 
   // ---------- structured-capture callbacks ----------
 
+  bot.callbackQuery(/^capture:ai:([^:]+)$/, async (ctx) => {
+    const pending = getPending(ctx.match![1]!);
+    if (!pending) {
+      await ctx.answerCallbackQuery({ text: 'Session expired. Send the task again.', show_alert: true });
+      return;
+    }
+    if (ctx.from.id !== pending.tgUserId) {
+      await ctx.answerCallbackQuery({ text: 'Only the sender can choose this.' });
+      return;
+    }
+    await ctx.answerCallbackQuery({ text: 'Sending this request to OpenAI…' });
+    await captureWithAI(ctx, pending);
+  });
+
+  bot.callbackQuery(/^capture:manual:([^:]+)$/, async (ctx) => {
+    const pending = getPending(ctx.match![1]!);
+    if (!pending) {
+      await ctx.answerCallbackQuery({ text: 'Session expired. Send the task again.', show_alert: true });
+      return;
+    }
+    if (ctx.from.id !== pending.tgUserId) {
+      await ctx.answerCallbackQuery({ text: 'Only the sender can choose this.' });
+      return;
+    }
+    await ctx.answerCallbackQuery();
+    const media = pending.captureType === 'photo' || pending.captureType === 'voice';
+    if (media && !pending.manualText?.trim()) {
+      updatePending(pending.id, { awaitingManual: true, aiSummarized: false });
+      const message = await ctx.reply('Reply to this message with the task title and any details. I will save it without AI.');
+      updatePending(pending.id, { promptMessageId: message.message_id });
+      return;
+    }
+    const proposal = plainProposal(pending.manualText ?? pending.original,
+      pending.captureType === 'photo' ? 'Photo task' : pending.captureType === 'voice' ? 'Voice task' : 'New task');
+    updatePending(pending.id, { proposal, aiSummarized: false, awaitingManual: false });
+    if (media) {
+      await sendMediaAttachmentChoice(ctx, pending);
+      return;
+    }
+    const messageId = await sendProposal(ctx, pending.id, proposal, pending.isPrivateChat, pending.links);
+    updatePending(pending.id, { promptMessageId: messageId });
+  });
+
+  bot.callbackQuery(/^capture:edit-ai:([^:]+)$/, async (ctx) => {
+    const pending = getPending(ctx.match![1]!);
+    if (!pending || !pending.correction) {
+      await ctx.answerCallbackQuery({ text: 'Correction expired. Edit the task again.', show_alert: true });
+      return;
+    }
+    if (ctx.from.id !== pending.tgUserId) {
+      await ctx.answerCallbackQuery({ text: 'Only the sender can choose this.' });
+      return;
+    }
+    if (!AI_ENABLED()) {
+      await ctx.answerCallbackQuery({ text: 'OpenAI is not configured.' });
+      return;
+    }
+    await ctx.answerCallbackQuery({ text: 'Sending your correction to OpenAI…' });
+    let revised: AIProposal | null = null;
+    try {
+      revised = await proposeFromText(pending.original, pending.proposal, pending.correction, pending.contextSnippets);
+    } catch (error) {
+      console.error('[telegram] requested AI correction failed:', error);
+    }
+    if (!revised) {
+      await ctx.reply('OpenAI could not apply that correction. You can choose “Use correction as written” on the previous prompt.');
+      return;
+    }
+    updatePending(pending.id, { proposal: revised, correction: undefined, aiSummarized: true });
+    const messageId = await sendProposal(ctx, pending.id, revised, pending.isPrivateChat, pending.links);
+    updatePending(pending.id, { promptMessageId: messageId });
+  });
+
+  bot.callbackQuery(/^capture:edit-manual:([^:]+)$/, async (ctx) => {
+    const pending = getPending(ctx.match![1]!);
+    if (!pending || !pending.correction) {
+      await ctx.answerCallbackQuery({ text: 'Correction expired. Edit the task again.', show_alert: true });
+      return;
+    }
+    if (ctx.from.id !== pending.tgUserId) {
+      await ctx.answerCallbackQuery({ text: 'Only the sender can choose this.' });
+      return;
+    }
+    await ctx.answerCallbackQuery();
+    const revised = plainProposal(pending.correction);
+    updatePending(pending.id, { proposal: revised, correction: undefined, aiSummarized: false });
+    const messageId = await sendProposal(ctx, pending.id, revised, pending.isPrivateChat, pending.links);
+    updatePending(pending.id, { promptMessageId: messageId });
+  });
+
   bot.callbackQuery(/^edit:([^:]+)$/, async (ctx) => {
     const pid = ctx.match![1]!;
     const pending = getPending(pid);
@@ -1975,7 +2110,7 @@ export function buildBot(token: string): Bot {
     updatePending(pid, { awaitingEdit: true });
     try {
       await ctx.editMessageText(
-        `${proposalText(pending.proposal, pending.links)}\n\n✏️ _Send your correction as a new message._`,
+        `${proposalText(pending.proposal, pending.links)}\n\n✏️ _Reply to this message with your correction. I will ask before sending it to OpenAI._`,
         { parse_mode: 'Markdown', reply_markup: undefined },
       );
     } catch {}
@@ -2346,6 +2481,25 @@ export function buildBot(token: string): Bot {
     if (!isPrivateChat && allowed !== null && chatId !== allowed) {
       return; // silent ignore outside family group
     }
+
+    // Group messages are opt-in: only process commands, direct @mentions, and
+    // replies to an active capture prompt. Ordinary conversation stays ignored.
+    let text = ctx.msg?.text ?? ctx.msg?.caption;
+    const username = botInstance?.botInfo?.username;
+    const mentionPattern = username ? new RegExp(`@${username}`, 'ig') : null;
+    const mentionsBot = Boolean(text && mentionPattern?.test(text));
+    const command = text ? parseCommand(text).command : null;
+    const pending = ctx.from ? getLatestForUser(ctx.from.id) : null;
+    const replyId = ctx.msg?.reply_to_message?.message_id;
+    const explicitPendingReply = Boolean(
+      pending && pending.chatId === chatId && replyId === pending.promptMessageId && (
+        pending.awaitingManual || pending.awaitingEdit || pending.awaitingLinks || pending.awaitingLinkNote ||
+        pending.attachMode === 'pickRecent' || pending.attachMode === 'pickFiltered'
+      ),
+    );
+    if (!isPrivateChat && !mentionsBot && !command && !explicitPendingReply) return;
+    if (text && mentionPattern) text = text.replace(mentionPattern, '').trim();
+
     const tgUser = ctx.from;
     if (!tgUser) return;
     const appUserId = await resolveAppUser(tgUser.id, tgUser.username);
@@ -2353,11 +2507,11 @@ export function buildBot(token: string): Bot {
 
     try {
       if (ctx.msg?.voice || ctx.msg?.audio) {
-        await handleVoice(ctx, appUserId, isPrivateChat);
+        await handleVoice(ctx, appUserId, isPrivateChat, text ?? '');
       } else if (ctx.msg?.photo) {
-        await handlePhoto(ctx, appUserId, isPrivateChat);
-      } else if (ctx.msg?.text) {
-        await handleText(ctx, ctx.msg.text, appUserId, isPrivateChat);
+        await handlePhoto(ctx, appUserId, isPrivateChat, text ?? '');
+      } else if (text) {
+        await handleText(ctx, text, appUserId, isPrivateChat);
       }
     } catch (e) {
       // Never drop user input silently: save a card with raw body if possible.
@@ -2402,6 +2556,9 @@ export async function startTelegramBot(): Promise<void> {
   if (!token) return;
   if (botInstance) return;
   botInstance = buildBot(token);
+  // Resolve the bot username before webhook updates arrive so direct mentions
+  // can be distinguished from ordinary group messages.
+  await botInstance.init();
   if (!projectionTimer) {
     projectionTimer = setInterval(() => {
       flushProjectionOutbox().catch((error) => console.error('[telegram] projection retry failed:', error));

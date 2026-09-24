@@ -263,7 +263,8 @@ function Authed({ meId }: { meId: string }) {
             setEditing(updated);
             addToast('Image attached', 'success');
           } else {
-            const created = await api.createCardFromImage(file);
+            const useAI = window.confirm('Send this image to OpenAI for a suggested task title and description? Choose Cancel to create the card manually.');
+            const created = await api.createCardFromImage(file, undefined, useAI);
             setCards((prev) =>
               prev.some((c) => c.id === created.id) ? prev : [...prev, created],
             );
@@ -305,7 +306,8 @@ function Authed({ meId }: { meId: string }) {
 
   const handleCreateFromImage = async (file: File, status: Status) => {
     try {
-      const created = await api.createCardFromImage(file, status);
+      const useAI = window.confirm('Send this image to OpenAI for a suggested task title and description? Choose Cancel to create the card manually.');
+      const created = await api.createCardFromImage(file, status, useAI);
       setCards((prev) =>
         prev.some((c) => c.id === created.id) ? prev : [...prev, created],
       );

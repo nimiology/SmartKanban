@@ -132,7 +132,7 @@ export async function attachmentUploadRoutes(app: FastifyInstance) {
   );
 
   // POST /api/cards/from-image — create a new card from a pasted image.
-  app.post(
+  app.post<{ Querystring: { use_ai?: string } }>(
     '/api/cards/from-image',
     { preHandler: requireUser },
     async (req, reply) => {
@@ -172,7 +172,7 @@ export async function attachmentUploadRoutes(app: FastifyInstance) {
 
         // Try AI vision title; on success, swap title/description and clear needs_review.
         let aiSummarized = false;
-        if (AI_ENABLED()) {
+        if (req.query.use_ai === 'true' && AI_ENABLED()) {
           const v = await summarizeImage(absPath);
           if (v) {
             await pool.query(

@@ -62,6 +62,7 @@ export const api = {
     req<void>(`/api/tokens/${token}`, { method: 'DELETE' }),
 
   review: () => req<ReviewData>('/api/review'),
+  reviewSummary: () => req<{ summary: string | null }>('/api/review/summary', { method: 'POST' }),
 
   linkTelegram: (b: { telegram_user_id: number; telegram_username?: string }) =>
     req<{ ok: boolean }>('/api/telegram/link', json(b)),
@@ -93,11 +94,11 @@ export const api = {
     return res.json();
   },
 
-  createCardFromImage: async (file: File, status?: Status): Promise<Card> => {
+  createCardFromImage: async (file: File, status?: Status, useAI = false): Promise<Card> => {
     const fd = new FormData();
     fd.append('file', file);
     if (status) fd.append('status', status);
-    const res = await fetch('/api/cards/from-image', {
+    const res = await fetch(`/api/cards/from-image?use_ai=${useAI}`, {
       method: 'POST',
       credentials: 'include',
       body: fd,

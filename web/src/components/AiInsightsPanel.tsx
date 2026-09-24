@@ -92,7 +92,7 @@ export function AiInsightsPanel({ cardId, onOpenCard, onOpenKnowledge }: Props) 
             disabled={submitting || loading}
             className="btn-pill btn-pill-filled-green"
           >
-            🤔 Brainstorm this card
+            🤖 Ask AI to brainstorm this card
           </button>
         </div>
       )}
