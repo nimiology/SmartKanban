@@ -130,7 +130,7 @@ function Authed({ meId }: { meId: string }) {
     if (settingsOpen) setSettingsOpen(false);
     else if (archiveOpen) { setArchiveOpen(false); setSection('board'); }
     else if (reviewOpen) setReviewOpen(false);
-    else if (captureOpen) setCaptureOpen(null);
+    else if (captureOpen) setCaptureOpen(false);
     else if (editing) setEditing(null);
   }, [editing, reviewOpen, archiveOpen, settingsOpen, captureOpen]);
 
@@ -492,7 +492,7 @@ function Authed({ meId }: { meId: string }) {
       {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
       {captureOpen && (
         <div
-          onClick={() => setCaptureOpen(null)}
+          onClick={() => setCaptureOpen(false)}
           style={{
             position: 'fixed', inset: 0, zIndex: 50,
             background: 'rgb(0 0 0 / 0.45)',
@@ -508,15 +508,15 @@ function Authed({ meId }: { meId: string }) {
               autoFocus
               onCreate={async (title, status) => {
                 await handleCreate(title, status);
-                setCaptureOpen(null);
+                setCaptureOpen(false);
               }}
               onCreateFromImage={async (file, status) => {
                 await handleCreateFromImage(file, status);
-                setCaptureOpen(null);
+                setCaptureOpen(false);
               }}
               onInstantiateTemplate={async (id, status) => {
                 await handleInstantiateTemplate(id, status);
-                setCaptureOpen(null);
+                setCaptureOpen(false);
               }}
               onVoiceTodo={() => addToast('Voice capture coming soon')}
             />
