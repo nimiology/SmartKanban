@@ -30,6 +30,7 @@ export function buildDedupePrompt(originalText: string, candidates: Candidate[])
     'Return strict JSON: {"matches":[{"ix":number,"confidence":0-100,"why":string}]}',
     `Only include items with confidence >= ${MIN_CONFIDENCE}. Cap at ${MAX_MATCHES} items.`,
     `"ix" is the number above. "why" is a short reason (under 60 chars).`,
+    'Write the "why" field in the language of the user message. Use Persian when that message is Persian.',
   ].join('\n');
 }
 

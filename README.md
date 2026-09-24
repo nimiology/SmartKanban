@@ -660,7 +660,7 @@ Per-client visibility filter applies to all `template.*` and
 | (voice/audio)    | DM / group | Whisper transcribe → card + audio attached                  |
 | (photo)          | DM / group | Vision summarize → card + image attached                    |
 | `/today <msg>`   | DM / group | Legacy shortcut; save directly to Inbox                     |
-| `/task`          | group reply | Create from replied-to message + bounded remembered context |
+| `/task [prompt]` | group reply | Create from replied-to text, photo, or audio + bounded remembered context |
 | `/topics status` | group      | Show workflow topic bindings                                |
 | `/topics bind …` | topic      | Bind current forum topic to a workflow route (admin)        |
 | `/start`         | task reply | Inbox → In Progress (owner)                                 |
@@ -671,6 +671,7 @@ Per-client visibility filter applies to all `template.*` and
 | `/done …`        | group      | Record production smoke result and close release (admin)    |
 | `/assign @user`  | reply      | Reassign card                                               |
 | `/share @a @b`   | reply      | Add sharers                                                 |
+| `/tag tags…`     | tag button, task reply, or task ID | Add tags without replying to a separate message |
 | `/use <name>`    | DM only    | Instantiate template                                        |
 | `/t <name>`      | DM only    | Alias for `/use`                                            |
 | `/templates`     | DM only    | List your visible templates                                 |

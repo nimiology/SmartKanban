@@ -62,6 +62,7 @@ export function buildBrainstormPrompt(
     webLines,
     '',
     'Write a concise structured response. Output strict JSON with these keys:',
+    'Write summary, reasons, and next steps in the language of the card. Use Persian when the card is Persian.',
     '  summary       — 2-3 sentences overall',
     '  related_items — up to 8 items from the local list above, with reason ({kind,id,title,why})',
     '  web_findings  — up to 3 items from web list ({title,url,why})',

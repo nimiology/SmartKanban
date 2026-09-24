@@ -18,6 +18,7 @@ Given a message (and optionally a prior proposal + correction), produce a concis
 - description: optional 1-2 sentences of extra detail; empty string if nothing adds value
 - tags: up to 3 lowercase single-word tags inferred from content ("groceries", "home", "work"); empty array is fine
 - reason: one-line explanation of your classification
+- Write the title, description, tags, and reason in the same language as the original message. Use Persian when the original message is Persian.
 
 Reply with ONLY JSON, no prose.`;
 

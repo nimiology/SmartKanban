@@ -31,6 +31,7 @@ import {
   archiveKnowledge,
   canUserSeeKnowledge,
   KnowledgeValidationError,
+  normaliseTags,
   validateUrl,
 } from '../knowledge.js';
 import { triggerFetch } from '../knowledge_fetch.js';
@@ -54,6 +55,13 @@ let botInstance: Bot | null = null;
 let pollingStarted = false;
 let projectionTimer: ReturnType<typeof setInterval> | null = null;
 const projectingCards = new Set<string>();
+const pendingTagTargets = new Map<number, {
+  kind: 'card' | 'knowledge';
+  id: string;
+  chatId: number | undefined;
+  createdAt: number;
+}>();
+const TAG_TARGET_TTL_MS = 15 * 60 * 1000;
 
 export function getBot(): Bot | null {
   return botInstance;
@@ -71,17 +79,63 @@ const STATUS_EMOJI: Record<Status, string> = {
 };
 
 const STATUS_LABEL: Record<Status, string> = {
-  inbox: 'Inbox',
-  in_progress: 'In Progress',
-  ready_for_test: 'Ready for Test',
-  needs_fix: 'Needs Fix',
-  ready_for_release: 'Ready for Release',
-  released: 'Released / Done',
+  inbox: 'صندوق ورودی',
+  in_progress: 'در حال انجام',
+  ready_for_test: 'آمادهٔ آزمایش',
+  needs_fix: 'نیازمند اصلاح',
+  ready_for_release: 'آمادهٔ انتشار',
+  released: 'منتشرشده / پایان‌یافته',
+};
+
+const ROUTE_LABEL: Record<string, string> = {
+  ...STATUS_LABEL,
+  bugs: 'اشکال‌ها / بررسی اولیه',
+};
+
+const WORK_TYPE_LABEL: Record<string, string> = {
+  feature: 'قابلیت',
+  bug: 'اشکال',
+  chore: 'کار نگه‌داری',
+  design: 'طراحی',
 };
 
 function allowedGroupId(): number | null {
   const raw = process.env.TELEGRAM_GROUP_ID;
   return raw ? Number(raw) : null;
+}
+
+function workflowErrorText(error: unknown): string {
+  if (!(error instanceof WorkflowError)) return 'انجام این کار با خطا روبه‌رو شد.';
+  const known: Record<string, string> = {
+    'Task not found or unavailable.': 'این کار پیدا نشد یا در دسترس نیست.',
+    'Only the task owner can start it.': 'فقط مسئول کار می‌تواند آن را شروع کند.',
+    'Only the task owner can submit it for testing.': 'فقط مسئول کار می‌تواند آن را برای آزمایش بفرستد.',
+    'Assign one owner and a different tester before testing.': 'پیش از آزمایش، یک مسئول و یک آزمایش‌گر متفاوت تعیین کن.',
+    'Only the assigned tester can fail this test.': 'فقط آزمایش‌گر تعیین‌شده می‌تواند این آزمایش را رد کند.',
+    'Only the assigned tester can approve the test.': 'فقط آزمایش‌گر تعیین‌شده می‌تواند آزمایش را تأیید کند.',
+    'Record a passing peer test first.': 'ابتدا نتیجهٔ موفق آزمایش همتا را ثبت کن.',
+    'Only the task owner can resume a failed task.': 'فقط مسئول کار می‌تواند کار ردشده را از سر بگیرد.',
+    'Only a release manager can close a release task.': 'فقط مدیر انتشار می‌تواند کار انتشار را ببندد.',
+    'A linked release must pass staging and production smoke checks first.': 'نسخهٔ پیوندشده باید ابتدا بررسی‌های محیط آزمایشی و تولید را با موفقیت بگذراند.',
+    'Release version or exact commit SHA does not match staging.': 'نسخه یا شناسهٔ دقیق commit با نتیجهٔ محیط آزمایشی هم‌خوانی ندارد.',
+    'Production cannot be marked until staging has passed.': 'تا زمانی که بررسی محیط آزمایشی موفق نشده، نتیجهٔ تولید ثبت نمی‌شود.',
+    'This release has already passed production smoke checks.': 'بررسی‌های تولید برای این انتشار قبلاً با موفقیت ثبت شده‌اند.',
+    'Task disappeared after transition.': 'پس از تغییر وضعیت، کار پیدا نشد.',
+  };
+  return known[error.message] ?? 'این جابه‌جایی در گردش کار مجاز نیست.';
+}
+
+function knowledgeErrorText(error: unknown): string {
+  if (!(error instanceof KnowledgeValidationError)) return 'ذخیرهٔ اطلاعات در دانش با خطا روبه‌رو شد.';
+  switch (error.field) {
+    case 'url': return 'پیوند معتبر نیست؛ فقط نشانی‌های http یا https پذیرفته می‌شوند.';
+    case 'tags': return 'برچسب‌ها نامعتبرند یا تعدادشان بیش از حد مجاز است.';
+    case 'title': return 'عنوان لازم است و نباید بیش از ۲۰۰ نویسه باشد.';
+    case 'visibility': return 'سطح دسترسی انتخاب‌شده معتبر نیست.';
+    case 'body': return 'متن یادداشت خالی است یا از اندازهٔ مجاز بیشتر شده است.';
+    case 'owner': return 'اجازهٔ تغییر این مورد را نداری.';
+    default: return 'اطلاعات واردشده معتبر نیست.';
+  }
 }
 
 export async function hasTelegramWorkflowTopic(status: Status, workType: string): Promise<boolean> {
@@ -108,11 +162,19 @@ async function resolveAppUser(telegramUserId: number, username?: string): Promis
 // Extract `#tag` tokens; strip them from the text; return (tags, cleanText).
 export function extractHashtags(text: string): { tags: string[]; text: string } {
   const tags: string[] = [];
-  const cleaned = text.replace(/(^|\s)#([a-zA-Z0-9_\-]+)/g, (_m, lead, tag) => {
+  const cleaned = text.replace(/(^|\s)#([\p{L}\p{N}_-]+)/gu, (_m, lead, tag) => {
     tags.push(String(tag).toLowerCase());
     return lead;
   });
   return { tags: Array.from(new Set(tags)), text: cleaned.replace(/\s+/g, ' ').trim() };
+}
+
+function parseTagNames(text: string): string[] {
+  return Array.from(new Set(
+    text.split(/[\s,،;؛]+/u)
+      .map((part) => part.trim().replace(/^#+/, '').replace(/[,:;،؛]+$/u, '').toLowerCase())
+      .filter(Boolean),
+  ));
 }
 
 // Parse leading slash-command; return { command, rest }.
@@ -241,13 +303,13 @@ const WORKFLOW_ROUTES: Record<string, Status | 'bugs'> = {
   bugs: 'bugs',
 };
 
-async function projectCardToTopic(cardId: string): Promise<void> {
+async function projectCardToTopic(cardId: string): Promise<boolean> {
   await pool.query(
     `INSERT INTO telegram_projection_outbox (card_id) VALUES ($1)
      ON CONFLICT (card_id) DO UPDATE SET next_attempt_at = NOW(), updated_at = NOW()`,
     [cardId],
   );
-  if (projectingCards.has(cardId)) return;
+  if (projectingCards.has(cardId)) return false;
   projectingCards.add(cardId);
   try {
     const delivered = await projectCardToTopicUnsafe(cardId);
@@ -259,6 +321,7 @@ async function projectCardToTopic(cardId: string): Promise<void> {
          WHERE card_id = $1`, [cardId],
       );
     }
+    return delivered;
   } catch (error) {
     console.error('[telegram] task topic projection failed:', error);
     await pool.query(
@@ -268,6 +331,7 @@ async function projectCardToTopic(cardId: string): Promise<void> {
        WHERE card_id = $1`,
       [cardId, String(error).slice(0, 500)],
     ).catch(() => {});
+    return false;
   } finally {
     projectingCards.delete(cardId);
   }
@@ -298,14 +362,15 @@ async function projectCardToTopicUnsafe(cardId: string): Promise<boolean> {
   ) : { rows: [] as Array<{ name: string }> };
   const lines = [
     `${STATUS_EMOJI[card.status]} ${card.title}`,
-    `#${card.work_type} · ${card.priority} · ${STATUS_LABEL[card.status]}`,
-    `Owner: ${owner.rows[0]?.name ?? 'unassigned'} · Tester: ${tester.rows[0]?.name ?? 'unassigned'}`,
-    `Task ID: ${card.id}`,
+    `${WORK_TYPE_LABEL[card.work_type] ?? card.work_type} · اولویت ${card.priority} · ${STATUS_LABEL[card.status]}`,
+    `مسئول: ${owner.rows[0]?.name ?? 'تعیین‌نشده'} · آزمایش‌گر: ${tester.rows[0]?.name ?? 'تعیین‌نشده'}`,
+    `شناسهٔ کار: ${card.id}`,
   ];
-  if (card.acceptance_criteria.length) lines.push(`Acceptance: ${card.acceptance_criteria.join(' · ')}`);
-  if (card.branch_url) lines.push(`Branch: ${card.branch_url}`);
-  if (card.pull_request_url) lines.push(`PR: ${card.pull_request_url}`);
-  if (card.peer_test_notes) lines.push(`Test notes: ${card.peer_test_notes}`);
+  if (card.tags.length) lines.push(`برچسب‌ها: ${card.tags.map((tag) => `#${tag}`).join(' ')}`);
+  if (card.acceptance_criteria.length) lines.push(`معیارهای پذیرش: ${card.acceptance_criteria.join(' · ')}`);
+  if (card.branch_url) lines.push(`شاخه: ${card.branch_url}`);
+  if (card.pull_request_url) lines.push(`درخواست ادغام: ${card.pull_request_url}`);
+  if (card.peer_test_notes) lines.push(`یادداشت‌های آزمایش: ${card.peer_test_notes}`);
   const nextUserIds = card.status === 'ready_for_test'
     ? (card.tester_user_id ? [card.tester_user_id] : [])
     : card.status === 'needs_fix'
@@ -320,22 +385,22 @@ async function projectCardToTopicUnsafe(cardId: string): Promise<boolean> {
        WHERE u.id = ANY($1::uuid[]) ORDER BY u.id, ti.created_at ASC`,
       [nextUserIds],
     );
-    const mentions = rows.map((row) => row.telegram_username ? `@${row.telegram_username}` : row.name ?? 'teammate');
-    if (mentions.length) lines.push(`Next: ${mentions.join(', ')}`);
+    const mentions = rows.map((row) => row.telegram_username ? `@${row.telegram_username}` : row.name ?? 'هم‌تیمی');
+    if (mentions.length) lines.push(`مرحلهٔ بعد: ${mentions.join('، ')}`);
   }
   const prior = await pool.query<{ message_id: string; thread_id: string }>(
     `SELECT message_id, thread_id FROM telegram_task_messages
      WHERE card_id = $1 AND is_current LIMIT 1`, [cardId],
   );
   const moved = prior.rows[0]
-    ? `\n↪ Moved to ${routeKey.replaceAll('_', ' ')}. The current task card is posted below.`
+    ? `\n↪ به تاپیک «${ROUTE_LABEL[routeKey] ?? routeKey}» منتقل شد؛ کارت فعلی در ادامه آمده است.`
     : '';
   if (prior.rows[0]) {
     try {
       await botInstance.api.editMessageText(
         groupId,
         Number(prior.rows[0].message_id),
-        `${card.title}\n${moved}`,
+        `📌 ${card.title}\n${moved}`,
       );
     } catch { /* old projection may have been deleted or become uneditable */ }
   }
@@ -438,7 +503,9 @@ async function downloadTelegramFile(
   const buf = Buffer.from(await res.arrayBuffer());
   const dir = path.join(ATTACHMENTS_DIR, cardId);
   await fs.mkdir(dir, { recursive: true });
-  const outPath = path.join(dir, `${fileId}${ext}`);
+  const remoteExt = path.extname(file.file_path ?? '').toLowerCase();
+  const outputExt = ext === '.ogg' && remoteExt && remoteExt !== '.oga' ? remoteExt : ext;
+  const outPath = path.join(dir, `${fileId}${outputExt}`);
   await fs.writeFile(outPath, buf);
   return outPath;
 }
@@ -452,20 +519,26 @@ async function reactOk(ctx: Context, emoji: ReactionEmoji = '👍'): Promise<voi
   } catch {}
 }
 
+async function sendToChatTopic(chatId: number | undefined, threadId: number | undefined, text: string): Promise<void> {
+  if (chatId === undefined) return;
+  if (!botInstance) return;
+  await botInstance.api.sendMessage(chatId, text, threadId === undefined ? {} : { message_thread_id: threadId });
+}
+
 export function extractUrls(text: string): string[] {
   const matches = text.match(/https?:\/\/[^\s<>"')\]]+/g) ?? [];
   return Array.from(new Set(matches.map((u) => u.replace(/[.,;:!?)]+$/, ''))));
 }
 
 function proposalText(p: AIProposal, links: string[] = []): string {
-  const tags = p.tags.length ? `\nTags: ${p.tags.map((t) => `#${t}`).join(' ')}` : '';
+  const tags = p.tags.length ? `\nبرچسب‌ها: ${p.tags.map((t) => `#${t}`).join(' ')}` : '';
   const desc = p.description ? `\n\n${p.description}` : '';
   const linksBlock = links.length
-    ? `\n\n🔗 ${links.map((l) => `[link](${l})`).join('  ·  ')}`
+    ? `\n\n🔗 ${links.map((l) => `[پیوند](${l})`).join('  ·  ')}`
     : '';
   const hint = p.is_actionable
     ? ''
-    : '\n\n_Doesn\'t look like a task — save anyway if you want._';
+    : '\n\n_این متن شبیه یک کار مشخص نیست؛ اگر خواستی بااین‌حال ثبتش کن._';
   return `📝 *${escapeMd(p.title)}*${desc}${tags}${linksBlock}${hint}`;
 }
 
@@ -490,34 +563,34 @@ function destinationKeyboard(
     kb.text(`${o.key === def ? '✓ ' : ''}${o.label}`, `dest:${o.key}:${pid}`);
   }
   kb.row()
-    .text('🤖 Check duplicates with AI', `dup:check:${pid}`)
-    .text('🔗 Link to existing', `linkpick:${pid}`);
+    .text('🤖 بررسی موارد تکراری', `dup:check:${pid}`)
+    .text('🔗 پیوند به مورد موجود', `linkpick:${pid}`);
   kb.row()
-    .text('✏️ Edit', `edit:${pid}`)
-    .text('❌ Cancel', `drop:${pid}`);
+    .text('✏️ ویرایش', `edit:${pid}`)
+    .text('❌ لغو', `drop:${pid}`);
   return kb;
 }
 
 function captureChoiceKeyboard(pid: string, mediaLabel?: string): InlineKeyboard {
   const kb = new InlineKeyboard();
   if (AI_ENABLED()) {
-    kb.text(mediaLabel ? `🤖 ${mediaLabel} with OpenAI` : '🤖 Draft with OpenAI', `capture:ai:${pid}`);
+    kb.text(mediaLabel ? `🤖 ${mediaLabel} با هوش مصنوعی` : '🤖 پیش‌نویس با هوش مصنوعی', `capture:ai:${pid}`);
   }
-  kb.text(mediaLabel ? '✍️ Enter task manually' : '✍️ Save my text as task', `capture:manual:${pid}`)
+  kb.text(mediaLabel ? '✍️ نوشتن جزئیات کار' : '✍️ ثبت متن من به‌عنوان کار', `capture:manual:${pid}`)
     .row()
-    .text('❌ Cancel', `drop:${pid}`);
+    .text('❌ لغو', `drop:${pid}`);
   return kb;
 }
 
 function correctionChoiceKeyboard(pid: string): InlineKeyboard {
   return new InlineKeyboard()
-    .text('🤖 Apply with OpenAI', `capture:edit-ai:${pid}`)
-    .text('✍️ Use correction as written', `capture:edit-manual:${pid}`)
+    .text('🤖 اعمال با هوش مصنوعی', `capture:edit-ai:${pid}`)
+    .text('✍️ استفاده از همین متن', `capture:edit-manual:${pid}`)
     .row()
-    .text('❌ Cancel', `drop:${pid}`);
+    .text('❌ لغو', `drop:${pid}`);
 }
 
-function plainProposal(text: string, fallbackTitle = 'New task'): AIProposal {
+function plainProposal(text: string, fallbackTitle = 'کار جدید'): AIProposal {
   const { tags, text: clean } = extractHashtags(text);
   const { title, description } = splitTitleDesc(clean);
   return {
@@ -536,56 +609,67 @@ async function sendCaptureChoice(
   mediaLabel?: string,
 ): Promise<void> {
   const aiConfigured = AI_ENABLED();
-  const message = await ctx.reply(
-    `${prompt}\n\n${aiConfigured
-      ? 'I will only send this content to OpenAI if you choose the OpenAI button.'
-      : 'OpenAI is not configured here; no AI call will be made.'}`,
-    { reply_markup: captureChoiceKeyboard(pending.id, mediaLabel) },
-  );
+  const text = `${prompt}\n\n${aiConfigured
+      ? 'این محتوا فقط در صورت انتخاب دکمهٔ هوش مصنوعی برای پردازش ارسال می‌شود.'
+      : 'هوش مصنوعی در این محیط تنظیم نشده است؛ پردازشی انجام نمی‌شود.'}`;
+  const replyMarkup = captureChoiceKeyboard(pending.id, mediaLabel);
+  const message = pending.taskSourceMessageId !== undefined && !pending.isPrivateChat
+    ? await ctx.api.sendMessage(pending.chatId, text, {
+      reply_markup: replyMarkup,
+      ...(pending.taskSourceThreadId ? { message_thread_id: pending.taskSourceThreadId } : {}),
+      ...(pending.captureMessageId !== undefined
+        ? { reply_parameters: { message_id: pending.captureMessageId, allow_sending_without_reply: true } }
+        : {}),
+    })
+    : await ctx.reply(text, { reply_markup: replyMarkup });
   updatePending(pending.id, { promptMessageId: message.message_id });
 }
 
 function helpText(): string {
   return [
-    'I ignore normal group conversation. Mention me, use a command, or reply to one of my active prompts.',
+    'گفت‌وگوی عادی گروه را نادیده می‌گیرم. برای کار با من، نام کاربری‌ام را صدا بزن، دستور بفرست یا به یکی از پیام‌های فعال من پاسخ بده.',
     '',
-    'Create tasks',
-    '• Mention me with a task: `@bot Add dark mode`',
-    '• Reply to a message with `/task [instruction]`',
-    '• Choose “Draft with OpenAI” or “Save my text as task” — I do not call OpenAI unless you tap its button.',
-    '• Send me a task in a private chat to get the same choices.',
-    '• `/today <task>` saves the text directly without AI.',
+    'ساخت کار',
+    '• نام کاربری‌ام را همراه با درخواست بیاور: `@bot حالت تیره را اضافه کن`',
+    '• برای ساخت کار از روی پیام متنی، عکس یا صدا، به آن پاسخ بده و بنویس: `/task [توضیح]`',
+    '• «پیش‌نویس با هوش مصنوعی» یا «ثبت متن من» را انتخاب کن؛ تا وقتی دکمهٔ هوش مصنوعی را نزنی، از آن استفاده نمی‌کنم.',
+    '• در گفت‌وگوی خصوصی هم می‌توانی کار بفرستی.',
+    '• پس از ثبت، کارت گروهی در تاپیک انتخابی منتشر می‌شود و بات در گفت‌وگوی عمومی فقط نتیجه را اعلام می‌کند.',
+    '• دستور `/today <کار>` متن را بدون هوش مصنوعی مستقیم در صندوق ورودی ثبت می‌کند.',
     '',
-    'Remember topic context',
-    '• Reply to a message with `/remember [note]` or `/forget`.',
+    'حافظهٔ محدود به تاپیک',
+    '• برای ذخیرهٔ متن یک پیام در همین تاپیک، به آن پاسخ بده و `/remember [یادداشت]` یا `/forget` را بفرست.',
     '',
-    'Task workflow (reply to a task card)',
-    '• `/start`, `/test`, `/approve`, `/fail [notes]`',
-    '• On a failed test, the task owner can tap “↩️ Back to In Progress” on the Needs Fix card.',
-    '• `/topics status` shows topic bindings; admins can use `/topics bind <route>` inside a topic.',
-    '• `/assign @user` and `/share @user` update a task.',
-    '• Admins: `/release <version> <commit-sha> <pass|fail> [notes]`, then `/done <version> <commit-sha> <pass|fail> [notes]`.',
+    'گردش کار (در پاسخ به کارت کار)',
+    '• `/start`، `/test`، `/approve`، `/fail [یادداشت]`',
+    '• پس از رد شدن در آزمایش، مسئول کار می‌تواند از کارت «نیازمند اصلاح» گزینهٔ «↩️ بازگشت به در حال انجام» را بزند.',
+    '• دستور `/topics status` اتصال تاپیک‌ها را نشان می‌دهد؛ مدیران می‌توانند داخل هر تاپیک `/topics bind <مسیر>` را اجرا کنند.',
+    '• دستورهای `/assign @user` و `/share @user` مسئولان و دسترسی کار را تغییر می‌دهند.',
+    '• برای افزودن برچسب به کارت، دکمهٔ «🏷 برچسب» را بزن و `/tag فوری، رابط کاربری` را بفرست؛ نیازی به پاسخ‌دادن به پیام نیست. همچنین می‌توانی `/tag <شناسه‌کار> برچسب۱، برچسب۲` را بفرستی.',
+    '• مدیران: `/release <نسخه> <شناسه-commit> <pass|fail> [یادداشت]` و سپس `/done <نسخه> <شناسه-commit> <pass|fail> [یادداشت]`.',
     '',
-    'Knowledge and templates (private chat)',
-    '• `/save <url> | <title>`, `/note <title> | <body>`, `/k <query>`, `/klist`.',
-    '• `/templates` lists templates; `/use <template>` creates one.',
+    'دانش و الگوها (گفت‌وگوی خصوصی)',
+    '• `/save <پیوند> | <عنوان>`، `/note <عنوان> | <متن>`، `/k <جست‌وجو>`، `/klist`.',
+    '• `/templates` الگوها را فهرست می‌کند و `/use <الگو>` یکی را اجرا می‌کند.',
     '',
-    'Other',
-    '• `/help` shows this guide.',
-    '• AI brainstorm and duplicate checks run only when you tap their clearly labeled AI buttons. Use `@ai` in a card discussion when you want an AI reply.',
+    'سایر دستورها',
+    '• برای دیدن این راهنما `/help` را بفرست.',
+    '• ایده‌پردازی و بررسی موارد تکراری با هوش مصنوعی فقط پس از زدن دکمهٔ مشخص‌شده انجام می‌شود. برای پاسخ هوش مصنوعی در گفت‌وگوی یک کارت، از `@ai` استفاده کن.',
   ].join('\n');
 }
 
 function columnKeyboard(pid: string): InlineKeyboard {
-  return new InlineKeyboard().text('📥 Inbox', `col:inbox:${pid}`);
+  return new InlineKeyboard()
+    .text(`📥 ${STATUS_LABEL.inbox}`, `col:inbox:${pid}`)
+    .text(`⚡ ${STATUS_LABEL.in_progress}`, `col:in_progress:${pid}`);
 }
 
 function attachmentKindKeyboard(pid: string): InlineKeyboard {
   return new InlineKeyboard()
-    .text('✨ New', `att:new:${pid}`)
-    .text('🔗 Attach to existing', `att:pick:${pid}`)
+    .text('✨ کار جدید', `att:new:${pid}`)
+    .text('🔗 افزودن به کار موجود', `att:pick:${pid}`)
     .row()
-    .text('❌ Cancel', `drop:${pid}`);
+    .text('❌ لغو', `drop:${pid}`);
 }
 
 function attachPickerKeyboard(
@@ -594,9 +678,9 @@ function attachPickerKeyboard(
 ): InlineKeyboard {
   const kb = new InlineKeyboard();
   for (const it of items) {
-    kb.text(`Pick: ${it.label.slice(0, 50)}`, `att:to:${it.kind}:${it.id}:${pid}`).row();
+    kb.text(`انتخاب: ${it.label.slice(0, 50)}`, `att:to:${it.kind}:${it.id}:${pid}`).row();
   }
-  kb.text('❌ Cancel', `drop:${pid}`);
+  kb.text('❌ لغو', `drop:${pid}`);
   return kb;
 }
 
@@ -608,25 +692,25 @@ function dupResultsKeyboard(
   const top = matches[0];
   if (top) {
     kb.text(
-      `🔗 Link to ${top.kind === 'card' ? 'card' : 'knowledge'}`,
+      `🔗 پیوند به ${top.kind === 'card' ? 'کار' : 'دانش'}`,
       `dup:link:${top.kind}:${top.id}:${pid}`,
     );
-    kb.text('👁 Same — just touch', `dup:touch:${top.kind}:${top.id}:${pid}`).row();
+    kb.text('👁 همان مورد است', `dup:touch:${top.kind}:${top.id}:${pid}`).row();
   }
-  kb.text('+ Save anyway', `dup:save:${pid}`).row().text('❌ Cancel', `drop:${pid}`);
+  kb.text('+ بااین‌حال ثبت کن', `dup:save:${pid}`).row().text('❌ لغو', `drop:${pid}`);
   return kb;
 }
 
 function postSaveKeyboard(cardId: string, currentStatus: Status): InlineKeyboard {
   const kb = new InlineKeyboard();
-  if (currentStatus === 'inbox') kb.text('▶️ Start', `wf:start:${cardId}`);
-  if (currentStatus === 'in_progress') kb.text('🧪 Submit for test', `wf:test:${cardId}`);
+  if (currentStatus === 'inbox') kb.text('▶️ شروع کار', `wf:start:${cardId}`);
+  if (currentStatus === 'in_progress') kb.text('🧪 ارسال برای آزمایش', `wf:test:${cardId}`);
   if (currentStatus === 'ready_for_test') {
-    kb.text('✅ Approve', `wf:approve:${cardId}`).text('🛠️ Needs fix', `wf:fail:${cardId}`);
+    kb.text('✅ تأیید', `wf:approve:${cardId}`).text('🛠️ نیازمند اصلاح', `wf:fail:${cardId}`);
   }
-  if (currentStatus === 'needs_fix') kb.text('↩️ Back to In Progress', `wf:start:${cardId}`);
-  kb.text('🗑', `arch:${cardId}`);
-  kb.row().text('🤖 AI brainstorm', `brain:${cardId}`);
+  if (currentStatus === 'needs_fix') kb.text('↩️ بازگشت به در حال انجام', `wf:start:${cardId}`);
+  kb.text('🗑 حذف', `arch:${cardId}`);
+  kb.row().text('🏷 برچسب', `ctag:${cardId}`).text('🤖 ایده‌پردازی با هوش مصنوعی', `brain:${cardId}`);
   return kb;
 }
 
@@ -648,7 +732,10 @@ async function sendProposal(
 ): Promise<number | null> {
   const def = defaultDestination(p, isPrivateChat, links.join(' '));
   try {
-    const msg = await ctx.reply(proposalText(p, links), {
+    const messageText = isPrivateChat
+      ? proposalText(p, links)
+      : 'پیش‌نویس آماده است. مقصد و تاپیک را انتخاب کن؛ کارت گروهی فقط در تاپیک انتخابی منتشر می‌شود.';
+    const msg = await ctx.reply(messageText, {
       parse_mode: 'Markdown',
       reply_markup: destinationKeyboard(
         pendingId,
@@ -685,11 +772,11 @@ async function handleText(
   if (tgUserId && !command) {
     const existing = getLatestForUser(tgUserId);
     if (existing?.awaitingManual) {
-      const proposal = plainProposal(text, existing.captureType === 'photo' ? 'Photo task' : existing.captureType === 'voice' ? 'Voice task' : 'New task');
+      const proposal = plainProposal(text, existing.captureType === 'photo' ? 'کار از تصویر' : existing.captureType === 'voice' ? 'کار از پیام صوتی' : 'کار جدید');
       updatePending(existing.id, { proposal, manualText: text, awaitingManual: false, aiSummarized: false });
       if (existing.captureType === 'photo' || existing.captureType === 'voice') {
         const message = await ctx.reply(
-          `✍️ Manual task details saved: ${proposal.title}\n\nCreate a new task or attach this file to an existing task?`,
+          `✍️ جزئیات کار ذخیره شد: ${proposal.title}\n\nکار جدید بسازم یا این فایل را به کار موجود پیوست کنم؟`,
           { reply_markup: attachmentKindKeyboard(existing.id) },
         );
         updatePending(existing.id, { promptMessageId: message.message_id });
@@ -702,7 +789,7 @@ async function handleText(
     if (existing && existing.awaitingEdit) {
       updatePending(existing.id, { awaitingEdit: false, correction: text });
       const message = await ctx.reply(
-        'Correction received. Choose whether to apply it with OpenAI or use it as written.',
+        'اصلاحیه دریافت شد. انتخاب کن که با هوش مصنوعی اعمال شود یا همین‌طور ثبت شود.',
         { reply_markup: correctionChoiceKeyboard(existing.id) },
       );
       updatePending(existing.id, { promptMessageId: message.message_id });
@@ -711,7 +798,7 @@ async function handleText(
     if (existing && existing.awaitingLinks) {
       const urls = extractUrls(text);
       if (urls.length === 0) {
-        await ctx.reply('No URL detected — send a link starting with http(s)://');
+        await ctx.reply('پیوندی پیدا نکردم؛ نشانی‌ای بفرست که با http:// یا https:// شروع شود.');
         return;
       }
       const merged = Array.from(new Set([...existing.links, ...urls]));
@@ -744,14 +831,14 @@ async function handleText(
 
   if (command === 'release' || command === 'done') {
     if (isPrivate || chatId !== allowedGroupId() || !(await isWorkflowAdmin(createdBy))) {
-      await ctx.reply('Release checks are available to workflow admins in the configured group.');
+      await ctx.reply('بررسی انتشار فقط برای مدیر گردش کار و در گروه تنظیم‌شده در دسترس است.');
       return;
     }
     const match = rest.trim().match(/^(\S+)\s+([a-f0-9]{40})\s+(pass|fail)(?:\s+([\s\S]+))?$/i);
     if (!match) {
       await ctx.reply(command === 'release'
-        ? 'Usage: `/release <version> <commit-sha> <pass|fail> [staging notes]`'
-        : 'Usage: `/done <version> <commit-sha> <pass|fail> [production smoke notes]`',
+        ? 'روش استفاده: `/release <version> <commit-sha> <pass|fail> [یادداشت محیط آزمایشی]`'
+        : 'روش استفاده: `/done <version> <commit-sha> <pass|fail> [یادداشت بررسی تولید]`',
       { parse_mode: 'Markdown' });
       return;
     }
@@ -772,7 +859,7 @@ async function handleText(
         [version, sha, passed ? 'passed' : 'failed', notes.slice(0, 2_000), createdBy],
       );
       if (!rows[0]) {
-        await ctx.reply('That version already exists with a different commit SHA or has completed production release.');
+        await ctx.reply('این نسخه با شناسهٔ commit دیگری ثبت شده یا انتشار تولید آن کامل شده است.');
         return;
       }
       const linked = passed
@@ -783,8 +870,8 @@ async function handleText(
         )
         : { rowCount: 0 };
       await ctx.reply(passed
-        ? `✅ Staging passed for ${version} (${sha.slice(0, 12)}). Linked ${linked.rowCount ?? 0} Ready for Release tasks. Run /done after production smoke checks.`
-        : `❌ Staging failed for ${version} (${sha.slice(0, 12)}). ${notes ? 'Notes recorded.' : 'Add notes with the command.'}`);
+        ? `✅ بررسی محیط آزمایشی نسخهٔ ${version} (${sha.slice(0, 12)}) موفق بود. ${linked.rowCount ?? 0} کار «آمادهٔ انتشار» به آن پیوند خورد. پس از بررسی تولید، /done را اجرا کن.`
+        : `❌ بررسی محیط آزمایشی نسخهٔ ${version} (${sha.slice(0, 12)}) ناموفق بود. ${notes ? 'یادداشت‌ها ثبت شدند.' : 'یادداشت‌ها را هم با دستور بفرست.'}`);
       return;
     }
 
@@ -836,7 +923,7 @@ async function handleText(
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
-      await ctx.reply(error instanceof WorkflowError ? error.message : 'Could not record production verification.');
+      await ctx.reply(error instanceof WorkflowError ? workflowErrorText(error) : 'ثبت نتیجهٔ بررسی تولید ممکن نشد.');
       return;
     } finally {
       client.release();
@@ -849,19 +936,19 @@ async function handleText(
       }
     }
     await ctx.reply(passed
-      ? `✅ Production smoke passed for ${version}. Released ${releasedIds.length} tasks.`
-      : `❌ Production smoke failed for ${version}. Tasks remain Ready for Release.`);
+      ? `✅ بررسی تولید نسخهٔ ${version} موفق بود؛ ${releasedIds.length} کار منتشر شد.`
+      : `❌ بررسی تولید نسخهٔ ${version} ناموفق بود؛ کارها همچنان در وضعیت «آمادهٔ انتشار» هستند.`);
     return;
   }
 
   if (command === 'topics') {
     const allowed = allowedGroupId();
     if (isPrivate || chatId === undefined || allowed === null || chatId !== allowed) {
-      await ctx.reply('Topic management is available only in the configured Telegram group.');
+      await ctx.reply('مدیریت تاپیک فقط در گروه تلگرام تنظیم‌شده در دسترس است.');
       return;
     }
     if (!(await isWorkflowAdmin(createdBy))) {
-      await ctx.reply('Only a workflow admin can bind topic routes.');
+      await ctx.reply('فقط مدیر گردش کار می‌تواند تاپیک‌ها را متصل کند.');
       return;
     }
     const [action, route] = rest.trim().toLowerCase().split(/\s+/, 2);
@@ -869,7 +956,7 @@ async function handleText(
       const routeKey = route ? WORKFLOW_ROUTES[route] : undefined;
       const threadId = ctx.msg?.message_thread_id;
       if (!routeKey || !threadId) {
-        await ctx.reply('Open a forum topic and run `/topics bind inbox|in-progress|ready-for-test|needs-fix|ready-for-release|released|bugs` there.', { parse_mode: 'Markdown' });
+        await ctx.reply('داخل تاپیک انجمن این دستور را اجرا کن: `/topics bind inbox|in-progress|ready-for-test|needs-fix|ready-for-release|released|bugs`.', { parse_mode: 'Markdown' });
         return;
       }
       try {
@@ -880,10 +967,10 @@ async function handleText(
              SET thread_id = EXCLUDED.thread_id, bound_by = EXCLUDED.bound_by, updated_at = NOW()`,
           [chatId, routeKey, threadId, createdBy],
         );
-        await ctx.reply(`Bound this topic to ${routeKey === 'bugs' ? 'Bugs / Triage' : STATUS_LABEL[routeKey]}.`);
+        await ctx.reply(`این تاپیک به «${ROUTE_LABEL[routeKey]}» متصل شد.`);
       } catch (error) {
         console.error('[telegram] topic bind failed:', error);
-        await ctx.reply('That topic is already bound to another workflow route. Check `/topics status`.');
+        await ctx.reply('این تاپیک از قبل به مسیر دیگری وصل است. با `/topics status` اتصال‌ها را بررسی کن.');
       }
       return;
     }
@@ -893,23 +980,23 @@ async function handleText(
         [chatId],
       );
       await ctx.reply(rows.length
-        ? `Workflow topic bindings:\n${rows.map((row) => `• ${row.route_key}: topic ${row.thread_id}`).join('\n')}`
-        : 'No topic routes are bound. Run `/topics bind <route>` from each forum topic.',
+        ? `اتصال تاپیک‌های گردش کار:\n${rows.map((row) => `• ${ROUTE_LABEL[row.route_key] ?? row.route_key}: تاپیک ${row.thread_id}`).join('\n')}`
+        : 'هنوز تاپیکی وصل نشده است. از داخل هر تاپیک انجمن دستور `/topics bind <route>` را اجرا کن.',
       { parse_mode: 'Markdown' });
       return;
     }
-    await ctx.reply('Use `/topics status` or run `/topics bind <route>` from inside a forum topic.', { parse_mode: 'Markdown' });
+    await ctx.reply('از `/topics status` استفاده کن یا داخل یک تاپیک انجمن `/topics bind <route>` را اجرا کن.', { parse_mode: 'Markdown' });
     return;
   }
 
   if (['start', 'test', 'approve', 'fail'].includes(command ?? '')) {
     const allowed = allowedGroupId();
     if (isPrivate || chatId === undefined || allowed === null || chatId !== allowed) {
-      await ctx.reply('Workflow actions are available only in the configured Telegram group.');
+      await ctx.reply('دستورهای گردش کار فقط در گروه تلگرام تنظیم‌شده در دسترس هستند.');
       return;
     }
     if (!referencedCardId) {
-      await ctx.reply(`Reply to a task card with /${command}${command === 'fail' ? ' <test notes>' : ''}.`);
+      await ctx.reply(`در پاسخ به کارت کار، دستور /${command}${command === 'fail' ? ' <یادداشت آزمایش>' : ''} را بفرست.`);
       return;
     }
     try {
@@ -918,7 +1005,7 @@ async function handleText(
           : command === 'approve' ? 'ready_for_release' : 'needs_fix';
       const task = await loadCard(referencedCardId);
       if (task && !(await hasTelegramWorkflowTopic(targetStatus, task.work_type))) {
-        await ctx.reply(`Bind the ${STATUS_LABEL[targetStatus]} topic first with /topics bind ${targetStatus.replaceAll('_', '-')}.`);
+        await ctx.reply(`ابتدا تاپیک «${STATUS_LABEL[targetStatus]}» را با دستور /topics bind ${targetStatus.replaceAll('_', '-')} وصل کن.`);
         return;
       }
       const updated = command === 'start'
@@ -928,12 +1015,12 @@ async function handleText(
           : await recordPeerTest(referencedCardId, createdBy, command === 'approve', rest.trim());
       broadcast({ type: 'card.updated', card: updated });
       await projectCardToTopic(updated.id);
-      await ctx.reply(`${STATUS_EMOJI[updated.status]} ${updated.title} → ${STATUS_LABEL[updated.status]}`);
+      await ctx.reply(`${STATUS_EMOJI[updated.status]} «${updated.title}» به «${STATUS_LABEL[updated.status]}» منتقل شد.`);
     } catch (error) {
-      if (error instanceof WorkflowError) await ctx.reply(error.message);
+      if (error instanceof WorkflowError) await ctx.reply(workflowErrorText(error));
       else {
         console.error('[telegram] workflow action failed:', error);
-        await ctx.reply('Could not update that task.');
+        await ctx.reply('به‌روزرسانی این کار ممکن نشد.');
       }
     }
     return;
@@ -944,15 +1031,15 @@ async function handleText(
     const source = ctx.msg?.reply_to_message;
     const sourceText = (source?.text ?? source?.caption ?? '').trim();
     if (isPrivate || chatId === undefined || allowed === null || chatId !== allowed) {
-      await ctx.reply('This command is available only in the configured Telegram group.');
+      await ctx.reply('این دستور فقط در گروه تلگرام تنظیم‌شده در دسترس است.');
       return;
     }
     if (!source || !source.message_id) {
-      await ctx.reply(`Reply to a text message with /${command}${command === 'remember' && rest.trim() ? ' <optional note>' : ''}.`);
+      await ctx.reply(`به یک پیام متنی پاسخ بده و دستور /${command}${command === 'remember' && rest.trim() ? ' <یادداشت اختیاری>' : ''} را بفرست.`);
       return;
     }
     if (!sourceText || source.from?.is_bot || source.from?.id === undefined) {
-      await ctx.reply('I can remember text messages from people, not bot messages or media without a caption.');
+      await ctx.reply('فقط پیام متنی افراد را می‌توانم به خاطر بسپارم؛ پیام بات یا رسانهٔ بدون توضیح قابل ذخیره نیست.');
       return;
     }
     const threadId = source.message_thread_id ?? ctx.msg?.message_thread_id ?? 0;
@@ -967,7 +1054,7 @@ async function handleText(
           body: sourceText,
           note: rest,
         });
-        await ctx.reply(`🧠 Remembered for ${REMEMBERED_CONTEXT_DAYS} days. It can be used as task context only in this same topic.`);
+        await ctx.reply(`🧠 این پیام تا ${REMEMBERED_CONTEXT_DAYS} روز ذخیره شد و فقط در همین تاپیک برای ساخت کار استفاده می‌شود.`);
       } else {
         const removed = await forgetContextMessage(
           chatId,
@@ -977,12 +1064,12 @@ async function handleText(
           ctx.from!.id,
         );
         await ctx.reply(removed
-          ? '🗑 Removed from remembered context.'
-          : 'Not found, or only the person who remembered it or the original author can forget it.');
+          ? '🗑 از حافظهٔ ذخیره‌شده حذف شد.'
+          : 'پیام پیدا نشد؛ فقط ذخیره‌کننده یا نویسندهٔ اصلی می‌تواند آن را حذف کند.');
       }
     } catch (error) {
       console.error('[telegram] remembered-context command failed:', error);
-      await ctx.reply('Could not update remembered context. Check that the database schema has been applied.');
+      await ctx.reply('به‌روزرسانی حافظه ممکن نشد. بررسی کن که تغییرات پایگاه داده اعمال شده باشند.');
     }
     return;
   }
@@ -991,24 +1078,29 @@ async function handleText(
     const allowed = allowedGroupId();
     const source = ctx.msg?.reply_to_message;
     if (isPrivate || chatId === undefined || allowed === null || chatId !== allowed) {
-      await ctx.reply('Use /task as a reply inside the configured Telegram group.');
+      await ctx.reply('دستور /task را در گروه تنظیم‌شده و در پاسخ به یک پیام بفرست.');
       return;
     }
-    if (!source || source.from?.is_bot || !(source.text ?? source.caption)?.trim()) {
-      await ctx.reply('Reply to a person\'s text message with /task <instruction>.');
+    const sourceText = (source?.text ?? source?.caption ?? '').trim().slice(0, 2_000);
+    const sourcePhotos = source?.photo;
+    const sourcePhoto = sourcePhotos?.[sourcePhotos.length - 1];
+    const sourceAudio = source?.voice ?? source?.audio;
+    if (!source || source.from?.is_bot || (!sourceText && !sourcePhoto && !sourceAudio)) {
+      await ctx.reply('با دستور /task به یک پیام متنی، عکس یا صدا پاسخ بده؛ اگر خواستی توضیح کار را هم بعد از دستور بنویس.');
       return;
     }
 
-    const sourceText = (source.text ?? source.caption ?? '').trim().slice(0, 2_000);
     const instruction = rest.trim().slice(0, 1_000);
     const guessedType = /#bug\b|\bbug\b/i.test(`${instruction} ${sourceText}`) ? 'bug' : 'chore';
     if (!(await hasTelegramWorkflowTopic('inbox', guessedType))) {
-      await ctx.reply(`Bind the ${guessedType === 'bug' ? 'Bugs / Triage' : 'Inbox'} topic first with /topics bind ${guessedType === 'bug' ? 'bugs' : 'inbox'}.`);
+      await ctx.reply(`ابتدا تاپیک «${guessedType === 'bug' ? ROUTE_LABEL.bugs : STATUS_LABEL.inbox}» را با دستور /topics bind ${guessedType === 'bug' ? 'bugs' : 'inbox'} وصل کن.`);
       return;
     }
+    const mediaHint = sourcePhoto ? 'پیام انتخاب‌شده شامل تصویر است.' : sourceAudio ? 'پیام انتخاب‌شده شامل فایل صوتی است.' : '';
+    const sourceDescription = sourceText || (sourcePhoto ? '[پیام تصویری]' : '[پیام صوتی]');
     const original = [
-      instruction ? `Task instruction: ${instruction}` : 'Task instruction: Create a task from the replied-to message.',
-      `Replied-to message: ${sourceText}`,
+      instruction ? `شرح کار: ${instruction}` : 'شرح کار: از پیام انتخاب‌شده یک کار بساز.',
+      `پیام انتخاب‌شده: ${sourceDescription}`,
     ].join('\n');
     const threadId = source.message_thread_id ?? ctx.msg?.message_thread_id ?? 0;
     const manualText = [instruction, sourceText].filter(Boolean).join('\n\n');
@@ -1021,14 +1113,133 @@ async function handleText(
       proposal: plainProposal(manualText),
     });
     updatePending(pending.id, {
-      captureType: 'text',
+      captureType: sourcePhoto ? 'photo' : sourceAudio ? 'voice' : 'text',
       manualText,
       captureMessageId: ctx.msg?.message_id,
       taskSourceMessageId: source.message_id,
       taskSourceThreadId: threadId,
       taskWorkType: guessedType,
+      ...(sourcePhoto ? { pendingPhotoFileId: sourcePhoto.file_id, attachMode: 'new' as const } : {}),
+      ...(sourceAudio ? { pendingAudioFileId: sourceAudio.file_id, attachMode: 'new' as const } : {}),
     });
-    await sendCaptureChoice(ctx, pending, 'Task request is ready. Draft it with AI, or save your text as the task. The AI option may also include matching messages you explicitly saved with /remember in this topic.');
+    await sendCaptureChoice(
+      ctx,
+      pending,
+      `درخواست آماده است.${mediaHint ? ` ${mediaHint}` : ''} پیش‌نویس را با هوش مصنوعی بساز یا متن خودت را به‌عنوان کار ثبت کن. گزینهٔ هوش مصنوعی می‌تواند پیام‌هایی را هم در نظر بگیرد که با /remember در همین تاپیک ذخیره کرده‌ای.`,
+      sourcePhoto ? 'توصیف تصویر' : sourceAudio ? 'پیاده‌سازی صدا' : undefined,
+    );
+    return;
+  }
+
+  if (command === 'tag') {
+    const raw = rest.trim();
+    if (!raw) {
+      await ctx.reply('روش استفاده: `/tag برچسب۱، برچسب۲` یا `/tag <شناسه‌کار> برچسب۱، برچسب۲`', { parse_mode: 'Markdown' });
+      return;
+    }
+    const explicitTarget = raw.match(/^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s+([\s\S]+)$/i);
+    const tagText = explicitTarget?.[2] ?? raw;
+    let tags: string[];
+    try {
+      tags = normaliseTags(parseTagNames(tagText));
+    } catch (error) {
+      await ctx.reply(knowledgeErrorText(error));
+      return;
+    }
+    if (tags.length === 0) {
+      await ctx.reply('یک یا چند برچسب بنویس؛ مثلاً `/tag فوری، رابط کاربری`.', { parse_mode: 'Markdown' });
+      return;
+    }
+
+    let cardId = explicitTarget?.[1] ?? referencedCardId;
+    let knowledgeId: string | null = null;
+    if (explicitTarget && !(await loadCard(explicitTarget[1]!))) {
+      cardId = null;
+      knowledgeId = explicitTarget[1]!;
+    }
+    if (!cardId && !knowledgeId && tgUserId) {
+      const target = pendingTagTargets.get(tgUserId);
+      if (target && Date.now() - target.createdAt <= TAG_TARGET_TTL_MS && target.chatId === chatId) {
+        if (target.kind === 'card') cardId = target.id;
+        else knowledgeId = target.id;
+      } else if (target) {
+        pendingTagTargets.delete(tgUserId);
+      }
+    }
+
+    if (cardId) {
+      const card = await loadCard(cardId);
+      if (!card || !(await canUserSeeCard(createdBy, cardId))) {
+        await ctx.reply('این کار پیدا نشد یا به آن دسترسی نداری.');
+        return;
+      }
+      const { rowCount } = await pool.query(
+        `UPDATE cards c
+         SET tags = ARRAY(
+           SELECT DISTINCT LOWER(tag)
+           FROM UNNEST(COALESCE(c.tags, ARRAY[]::text[]) || $2::text[]) AS merged(tag)
+         ), updated_at = NOW()
+         WHERE c.id = $1 AND NOT c.archived`,
+        [cardId, tags],
+      );
+      if (!rowCount) {
+        await ctx.reply('این کار بایگانی شده یا دیگر در دسترس نیست.');
+        return;
+      }
+      await logActivity(createdBy, cardId, 'telegram.tags', { added: tags });
+      const updated = (await loadCard(cardId))!;
+      broadcast({ type: 'card.updated', card: updated });
+      const { rows } = await pool.query<{
+        telegram_chat_id: number | string | null;
+        projected_to_group: boolean;
+      }>(
+        `SELECT c.telegram_chat_id,
+                EXISTS (SELECT 1 FROM telegram_task_messages tm WHERE tm.card_id = c.id AND tm.chat_id = $2) AS projected_to_group
+         FROM cards c WHERE c.id = $1`,
+        [cardId, allowedGroupId()],
+      );
+      const groupId = allowedGroupId();
+      const isPublicGroupCard = groupId !== null && (
+        Number(rows[0]?.telegram_chat_id) === groupId || rows[0]?.projected_to_group === true
+      );
+      const projected = chatId === groupId && isPublicGroupCard
+        ? await projectCardToTopic(cardId)
+        : false;
+      if (tgUserId) pendingTagTargets.delete(tgUserId);
+      const routeKey = updated.status === 'inbox' && updated.work_type === 'bug' ? 'bugs' : updated.status;
+      const destination = chatId === groupId && isPublicGroupCard
+        ? projected
+          ? `؛ کارت در تاپیک «${ROUTE_LABEL[routeKey]}» هم به‌روز شد`
+          : `؛ به‌روزرسانی کارت در تاپیک «${ROUTE_LABEL[routeKey]}» در صف ارسال است`
+        : '';
+      await ctx.reply(`🏷 برچسب‌ها به «${updated.title}» اضافه شد: ${tags.map((tag) => `#${tag}`).join(' ')}${destination}.`);
+      return;
+    }
+
+    if (knowledgeId) {
+      try {
+        const item = await loadKnowledge(knowledgeId);
+        if (!item || item.owner_id !== createdBy) {
+          await ctx.reply('این مورد دانش پیدا نشد یا اجازهٔ ویرایشش را نداری.');
+          return;
+        }
+        const updated = await updateKnowledge(createdBy, knowledgeId, {
+          tags: normaliseTags([...item.tags, ...tags]),
+        });
+        if (!updated) {
+          await ctx.reply('این مورد دانش دیگر در دسترس نیست.');
+          return;
+        }
+        broadcast({ type: 'knowledge.updated', knowledge: updated });
+        if (tgUserId) pendingTagTargets.delete(tgUserId);
+        await ctx.reply(`🏷 برچسب‌ها به «${updated.title}» اضافه شد: ${tags.map((tag) => `#${tag}`).join(' ')}`);
+      } catch (error) {
+        await ctx.reply(knowledgeErrorText(error));
+      }
+      return;
+    }
+
+    await ctx.reply('برای دانش، اول دکمهٔ «🏷 برچسب» همان مورد را بزن؛ برای کار، دکمهٔ برچسب را بزن یا شناسهٔ کار را در دستور بنویس.');
     return;
   }
 
@@ -1069,11 +1280,15 @@ async function handleText(
     return;
   }
 
-  // Legacy /today alias creates a task in the new Inbox workflow.
+  // The /today alias creates a task in the Inbox workflow.
   const { tags, text: clean } = extractHashtags(body);
   if (command === 'today') {
     const { title, description } = splitTitleDesc(clean);
     if (!title) return;
+    if (!isPrivate && allowedGroupId() !== null && !(await hasTelegramWorkflowTopic('inbox', 'chore'))) {
+      await ctx.reply('ابتدا تاپیک «صندوق ورودی» را با دستور /topics bind inbox وصل کن.');
+      return;
+    }
     const cardId = await createCard({
       title,
       description,
@@ -1088,7 +1303,17 @@ async function handleText(
     await logActivity(createdBy, cardId, 'telegram.today');
     const card = (await loadCard(cardId))!;
     broadcast({ type: 'card.created', card });
-    await reactOk(ctx);
+    const routeKey = card.work_type === 'bug' ? 'bugs' : card.status;
+    const groupConfigured = allowedGroupId() !== null;
+    const projected = !isPrivate && groupConfigured ? await projectCardToTopic(cardId) : false;
+    const routeLabel = ROUTE_LABEL[routeKey] ?? STATUS_LABEL[card.status];
+    await ctx.reply(isPrivate
+      ? `✅ «${card.title}» در کارهای شخصی شما ثبت شد.`
+      : !groupConfigured
+        ? '✅ کار ثبت شد؛ گروه تلگرام برای انتشار در تاپیک تنظیم نشده است.'
+        : projected
+          ? `✅ کار به تاپیک «${routeLabel}» اضافه شد.`
+          : `✅ کار ثبت شد؛ فرستادن آن به تاپیک «${routeLabel}» در صف است.`);
     return;
   }
 
@@ -1100,14 +1325,14 @@ async function handleText(
   if ((command === 'use' || command === 't') && isPrivate) {
     const name = rest.trim();
     if (!name) {
-      await ctx.reply('Usage: `/use <template>` — see `/templates` for the list.', {
+      await ctx.reply('روش استفاده: `/use <نام الگو>` — فهرست الگوها را با `/templates` ببین.', {
         parse_mode: 'Markdown',
       });
       return;
     }
     const tpl = await findTemplateByName(createdBy, name);
     if (!tpl) {
-      await ctx.reply(`No template \`${escapeMd(name)}\`. Try /templates.`, {
+      await ctx.reply(`الگوی \`${escapeMd(name)}\` پیدا نشد. دستور /templates را امتحان کن.`, {
         parse_mode: 'Markdown',
       });
       return;
@@ -1118,14 +1343,13 @@ async function handleText(
       telegramMessageId: ctx.msg?.message_id,
     });
     if (!card) {
-      await ctx.reply('Template no longer exists.');
+      await ctx.reply('این الگو دیگر وجود ندارد.');
       return;
     }
     broadcast({ type: 'card.created', card });
     // instantiateTemplate already logs a 'create' activity with template_id/template_name.
     // The source=telegram column on the card distinguishes this path; no extra log needed.
-    await reactOk(ctx);
-    await ctx.reply(`✓ Saved · ${STATUS_EMOJI[card.status]} ${STATUS_LABEL[card.status]} — ${escapeMd(card.title)}`, {
+    await ctx.reply(`✅ «${escapeMd(card.title)}» در وضعیت «${STATUS_LABEL[card.status]}» ثبت شد.`, {
       parse_mode: 'Markdown',
       reply_markup: postSaveKeyboard(card.id, card.status),
     });
@@ -1135,7 +1359,7 @@ async function handleText(
   if (command === 'templates' && isPrivate) {
     const list = await listTemplates(createdBy);
     if (list.length === 0) {
-      await ctx.reply('No templates yet. Add one in Settings → Templates.');
+      await ctx.reply('هنوز الگویی نداری. از تنظیمات ← الگوها، یکی بساز.');
       return;
     }
     const lines = list.map(
@@ -1158,7 +1382,7 @@ async function handleText(
   if (tgUserId === undefined || chatId === undefined) return;
   const manualText = (command ? rest : text) || text;
   if (!manualText.trim()) {
-    await ctx.reply('Please include the task details after mentioning me. Use /help for examples.');
+    await ctx.reply('لطفاً پس از صدا زدن بات، توضیح کار را هم بنویس. برای نمونه‌ها /help را ببین.');
     return;
   }
   const pending = createPending({
@@ -1176,7 +1400,7 @@ async function handleText(
     captureMessageId: ctx.msg?.message_id,
     links: seededLinks,
   });
-  await sendCaptureChoice(ctx, pending, 'Choose how to save this task.');
+  await sendCaptureChoice(ctx, pending, 'روش ثبت این کار را انتخاب کن.');
 }
 
 async function handleVoice(
@@ -1194,8 +1418,8 @@ async function handleVoice(
     appUserId,
     chatId,
     isPrivateChat: isPrivate,
-    original: manualText || 'Voice note task',
-    proposal: plainProposal(manualText, 'Voice note task'),
+    original: manualText || 'کار از پیام صوتی',
+    proposal: plainProposal(manualText, 'کار از پیام صوتی'),
   });
   updatePending(pending.id, {
     captureType: 'voice',
@@ -1207,8 +1431,8 @@ async function handleVoice(
   await sendCaptureChoice(
     ctx,
     pending,
-    'Voice note received. You can ask OpenAI to transcribe it, or enter the task details yourself.',
-    'Transcribe audio',
+    'پیام صوتی رسید. می‌توانی از هوش مصنوعی بخواهی آن را پیاده‌سازی کند یا جزئیات کار را خودت بنویسی.',
+    'پیاده‌سازی صدا',
   );
 }
 
@@ -1227,8 +1451,8 @@ async function handlePhoto(
     appUserId,
     chatId,
     isPrivateChat: isPrivate,
-    original: manualText || 'Photo task',
-    proposal: plainProposal(manualText, 'Photo task'),
+    original: manualText || 'کار از تصویر',
+    proposal: plainProposal(manualText, 'کار از تصویر'),
   });
   updatePending(pending.id, {
     captureType: 'photo',
@@ -1240,23 +1464,30 @@ async function handlePhoto(
   await sendCaptureChoice(
     ctx,
     pending,
-    'Image received. You can ask OpenAI to describe it, or enter the task details yourself.',
-    'Analyze image',
+    'تصویر رسید. می‌توانی از هوش مصنوعی بخواهی آن را توصیف کند یا جزئیات کار را خودت بنویسی.',
+    'توصیف تصویر',
   );
 }
 
 async function sendMediaAttachmentChoice(ctx: Context, pending: PendingProposal): Promise<void> {
   const icon = pending.captureType === 'photo' ? '📷' : '🎙';
-  const message = await ctx.reply(
-    `${icon} ${pending.proposal.title}${pending.proposal.description ? `\n\n${pending.proposal.description}` : ''}\n\nCreate a new task or attach this file to an existing task?`,
-    { reply_markup: attachmentKindKeyboard(pending.id) },
-  );
+  const details = pending.isPrivateChat
+    ? ` ${pending.proposal.title}${pending.proposal.description ? `\n\n${pending.proposal.description}` : ''}`
+    : ' فایل آماده است.';
+  const text = `${icon}${details}\n\nکار جدید بسازم یا این فایل را به کار موجود پیوست کنم؟`;
+  const replyMarkup = attachmentKindKeyboard(pending.id);
+  const message = pending.taskSourceMessageId !== undefined && !pending.isPrivateChat
+    ? await ctx.api.sendMessage(pending.chatId, text, {
+      reply_markup: replyMarkup,
+      ...(pending.taskSourceThreadId ? { message_thread_id: pending.taskSourceThreadId } : {}),
+    })
+    : await ctx.reply(text, { reply_markup: replyMarkup });
   updatePending(pending.id, { promptMessageId: message.message_id });
 }
 
 async function captureWithAI(ctx: Context, pending: PendingProposal): Promise<void> {
   if (!AI_ENABLED()) {
-    await ctx.reply('OpenAI is not configured. No task was created; use the manual option.');
+    await ctx.reply('هوش مصنوعی تنظیم نشده است. کاری ثبت نشد؛ گزینهٔ ثبت دستی را انتخاب کن.');
     return;
   }
 
@@ -1286,7 +1517,7 @@ async function captureWithAI(ctx: Context, pending: PendingProposal): Promise<vo
       try {
         const transcript = await transcribeAudio(audioPath);
         if (transcript) {
-          proposal = plainProposal([pending.manualText, transcript].filter(Boolean).join('\n\n'), 'Voice task');
+          proposal = plainProposal([pending.manualText, transcript].filter(Boolean).join('\n\n'), 'کار از پیام صوتی');
           usedAI = true;
           updatePending(pending.id, { original: transcript });
         }
@@ -1317,7 +1548,7 @@ async function captureWithAI(ctx: Context, pending: PendingProposal): Promise<vo
   }
 
   if (!proposal) {
-    await ctx.reply('OpenAI could not prepare this task. Nothing was saved; use the manual option on the original prompt.');
+    await ctx.reply('هوش مصنوعی نتوانست این کار را آماده کند و چیزی ذخیره نشد. گزینهٔ دستی را روی پیام قبلی انتخاب کن.');
     return;
   }
   updatePending(pending.id, { proposal, aiSummarized: usedAI, awaitingManual: false });
@@ -1360,9 +1591,9 @@ async function finalizeKnowledge(ctx: Context, pending: PendingProposal): Promis
     if (url) {
       try { triggerFetch(created.id); } catch { /* non-fatal */ }
     }
-    await ctx.reply(`📚 Saved · ${title}`);
+    await ctx.reply(`📚 «${title}» به دانش ذخیره شد.`);
   } catch (e) {
-    await ctx.reply(`Save failed: ${e instanceof Error ? e.message : 'error'}`);
+    await ctx.reply(`ذخیره انجام نشد: ${knowledgeErrorText(e)}`);
   }
   deletePending(pending.id);
 }
@@ -1381,7 +1612,10 @@ async function finalizeCard(
     tags: proposal.tags ?? [],
     createdBy: pending.appUserId,
     source: 'telegram',
-    status,
+    // New work is first recorded in Inbox. Starting it is a real workflow
+    // transition so permissions, activity history, and the projection outbox
+    // remain consistent with board and Telegram controls.
+    status: status === 'in_progress' ? 'inbox' : status,
     workType: pending.taskWorkType ?? 'chore',
     aiSummarized: pending.aiSummarized ?? false,
     assignees,
@@ -1403,11 +1637,17 @@ async function finalizeCard(
     } catch { /* non-fatal */ }
   }
 
-  const card = await loadCard(cardId);
+  let card = await loadCard(cardId);
+  if (card && status === 'in_progress') {
+    card = await transitionCard(cardId, pending.appUserId, 'in_progress');
+  }
   if (card) {
     broadcast({ type: 'card.created', card });
   }
-  if (pending.taskSourceMessageId !== undefined) await projectCardToTopic(cardId);
+  const routeKey = status === 'inbox' && pending.taskWorkType === 'bug' ? 'bugs' : status;
+  const groupConfigured = allowedGroupId() !== null;
+  const shouldProject = !isPrivate && groupConfigured;
+  const projected = shouldProject ? await projectCardToTopic(cardId) : false;
 
   await logActivity(
     pending.appUserId,
@@ -1420,21 +1660,30 @@ async function finalizeCard(
     taskContextDetails(pending),
   );
   deletePending(pending.id);
-  const emoji = STATUS_EMOJI[status];
-  const label = STATUS_LABEL[status];
-  await ctx.reply(`✓ Saved · ${emoji} ${label} — ${proposal.title}`, {
-    reply_markup: postSaveKeyboard(cardId, status),
-  });
+  if (isPrivate) {
+    await ctx.reply(pending.isPrivateChat
+      ? `✅ کار «${proposal.title}» در کارهای شخصی شما ثبت شد.`
+      : '✅ کار خصوصی در کارهای شخصی شما ثبت شد.', {
+      reply_markup: pending.isPrivateChat ? postSaveKeyboard(cardId, status) : undefined,
+    });
+    return;
+  }
+  const routeLabel = ROUTE_LABEL[routeKey] ?? STATUS_LABEL[status];
+  await ctx.reply(!groupConfigured
+    ? '✅ کار ثبت شد؛ گروه تلگرام برای انتشار در تاپیک تنظیم نشده است.'
+    : projected
+      ? `✅ کار به تاپیک «${routeLabel}» اضافه شد.`
+      : `✅ کار ثبت شد؛ فرستادن آن به تاپیک «${routeLabel}» در صف است.`);
 }
 
 function relativeAge(iso: string): string {
   const d = Date.now() - new Date(iso).getTime();
   const days = Math.floor(d / 86_400_000);
-  if (days >= 1) return `${days}d ago`;
+  if (days >= 1) return `${days} روز پیش`;
   const hrs = Math.floor(d / 3_600_000);
-  if (hrs >= 1) return `${hrs}h ago`;
+  if (hrs >= 1) return `${hrs} ساعت پیش`;
   const mins = Math.floor(d / 60_000);
-  return `${Math.max(1, mins)}m ago`;
+  return `${Math.max(1, mins)} دقیقه پیش`;
 }
 
 // ---------- attach-picker helpers ----------
@@ -1469,7 +1718,7 @@ async function showAttachPicker(
     );
     cardItems = cs.rows.map((c) => ({ id: c.id, label: `${STATUS_EMOJI[c.status]} ${c.title}` }));
     const ks = await pool.query<{ id: string; title: string }>(
-      `SELECT k.id, COALESCE(NULLIF(k.title, ''), '(untitled)') AS title
+      `SELECT k.id, COALESCE(NULLIF(k.title, ''), '(بدون عنوان)') AS title
        FROM knowledge_items k
        LEFT JOIN knowledge_shares ks ON ks.knowledge_id = k.id
        WHERE NOT k.archived
@@ -1493,12 +1742,12 @@ async function showAttachPicker(
     attachPickerIds: items.map((it) => ({ kind: it.kind, id: it.id })),
   });
   if (items.length === 0) {
-    await ctx.reply('No items found. Reply with different words or tap Cancel.', {
-      reply_markup: new InlineKeyboard().text('❌ Cancel', `drop:${pending.id}`),
+    await ctx.reply('موردی پیدا نشد. با واژه‌های دیگری پاسخ بده یا لغو را بزن.', {
+      reply_markup: new InlineKeyboard().text('❌ لغو', `drop:${pending.id}`),
     });
     return;
   }
-  await ctx.reply('Pick one (or reply with a few words to filter):', {
+  await ctx.reply('یک مورد را انتخاب کن یا برای جست‌وجو چند واژه بفرست:', {
     reply_markup: attachPickerKeyboard(pending.id, items),
   });
 }
@@ -1510,7 +1759,7 @@ async function attachToTarget(
   targetId: string,
 ): Promise<void> {
   if (!pending.pendingPhotoFileId && !pending.pendingAudioFileId) {
-    await ctx.reply('Nothing to attach.');
+    await ctx.reply('فایلی برای پیوست‌کردن وجود ندارد.');
     deletePending(pending.id);
     return;
   }
@@ -1528,13 +1777,14 @@ async function attachToTarget(
       if (card) broadcast({ type: 'card.updated', card });
       const actionLabel = pending.pendingPhotoFileId ? 'telegram.photo.attach' : 'telegram.voice.attach';
       await logActivity(pending.appUserId, targetId, actionLabel);
-      await ctx.reply('📎 Attached to card.');
+      await ctx.reply('📎 فایل به کار پیوست شد.');
     } catch (e) {
-      await ctx.reply(`Attach failed: ${e instanceof Error ? e.message : 'error'}`);
+      console.error('[telegram] attachment failed:', e);
+      await ctx.reply('پیوست فایل انجام نشد. دوباره تلاش کن.');
     }
   } else {
     // Knowledge items don't support binary attachments — fall back to new private card.
-    await ctx.reply("Knowledge items don't support attachments yet — saving as new card instead.");
+    await ctx.reply('فعلاً نمی‌توان فایل را به مورد دانش پیوست کرد؛ آن را به‌صورت یک کار جدید ثبت می‌کنم.');
     updatePending(pending.id, { destination: 'private_card', attachMode: 'new' });
     await finalizeCard(ctx, pending, 'inbox');
     return;
@@ -1549,7 +1799,7 @@ async function runDuplicateCheck(ctx: Context, pending: PendingProposal): Promis
     searchKnowledgeFts(pending.appUserId, q, 10),
   ]);
   if (cardHits.length === 0 && kHits.length === 0) {
-    await ctx.reply('🔍 No related items found. Pick a destination above to save.');
+    await ctx.reply('🔍 مورد مرتبطی پیدا نشد. برای ذخیره، یکی از مقصدهای بالا را انتخاب کن.');
     return;
   }
   const candidates: Candidate[] = [
@@ -1565,12 +1815,12 @@ async function runDuplicateCheck(ctx: Context, pending: PendingProposal): Promis
       id: h.id,
       title: h.title,
       snippet: h.snippet,
-      contextLine: h.url ? 'Knowledge (URL)' : 'Knowledge (note)',
+      contextLine: h.url ? 'دانش (پیوند)' : 'دانش (یادداشت)',
     })),
   ];
   const ranked = await rankCandidates(pending.original, candidates);
   if (ranked.length === 0) {
-    await ctx.reply('🔍 No strong matches found. Pick a destination above to save.');
+    await ctx.reply('🔍 مورد مشابهِ قابل‌توجهی پیدا نشد. برای ذخیره، یکی از مقصدهای بالا را انتخاب کن.');
     return;
   }
   updatePending(pending.id, {
@@ -1585,11 +1835,12 @@ async function runDuplicateCheck(ctx: Context, pending: PendingProposal): Promis
     })),
   });
   const lines = ranked.map((r) => {
-    const conf = r.confidence !== undefined ? ` — ${r.confidence}% match` : '';
-    const why = r.why ? `\n      why: ${r.why}` : '';
-    return `• [${r.kind}] '${r.title}' (${r.contextLine})${conf}${why}`;
+    const conf = r.confidence !== undefined ? ` — ${r.confidence}% شباهت` : '';
+    const why = r.why ? `\n      دلیل: ${r.why}` : '';
+    const kind = r.kind === 'card' ? 'کار' : 'دانش';
+    return `• [${kind}] «${r.title}» (${r.contextLine})${conf}${why}`;
   });
-  await ctx.reply(`🔍 Found ${ranked.length} possibly related:\n${lines.join('\n')}`, {
+  await ctx.reply(`🔍 ${ranked.length} مورد مرتبط احتمالی پیدا شد:\n${lines.join('\n')}`, {
     reply_markup: dupResultsKeyboard(pending.id, ranked),
   });
 }
@@ -1612,7 +1863,7 @@ async function handlePostSaveCallback(ctx: Context): Promise<boolean> {
   );
   const creator = rows[0]?.created_by ?? null;
   if (!appUserId || (archMatch && (!creator || appUserId !== creator))) {
-    await ctx.answerCallbackQuery({ text: 'Only the creator can change this.' });
+    await ctx.answerCallbackQuery({ text: 'فقط سازنده می‌تواند این مورد را تغییر دهد.' });
     return true;
   }
 
@@ -1624,9 +1875,9 @@ async function handlePostSaveCallback(ctx: Context): Promise<boolean> {
     await logActivity(appUserId, cardId, 'telegram.archive');
     broadcast({ type: 'card.deleted', id: cardId });
     try {
-      await ctx.editMessageText('🗑 Archived.', { reply_markup: undefined });
+      await ctx.editMessageText('🗑 بایگانی شد.', { reply_markup: undefined });
     } catch {}
-    await ctx.answerCallbackQuery({ text: 'Archived' });
+    await ctx.answerCallbackQuery({ text: 'بایگانی شد.' });
     return true;
   }
 
@@ -1637,7 +1888,7 @@ async function handlePostSaveCallback(ctx: Context): Promise<boolean> {
   const currentCard = await loadCard(cardId);
   if (currentCard && !(await hasTelegramWorkflowTopic(targetStatus, currentCard.work_type))) {
     await ctx.answerCallbackQuery({
-      text: `Bind the ${STATUS_LABEL[targetStatus]} topic first.`,
+      text: `ابتدا تاپیک «${STATUS_LABEL[targetStatus]}» را به بات وصل کن.`,
       show_alert: true,
     });
     return true;
@@ -1653,9 +1904,7 @@ async function handlePostSaveCallback(ctx: Context): Promise<boolean> {
   await projectCardToTopic(card.id);
   try {
     const current = ctx.callbackQuery!.message?.text ?? '';
-    // Replace any existing "✓ Saved · …" badge line with the new one; fall back to prepend.
-    const nextBody = current.replace(/^(✓ Saved · )[^\n]*/, `$1${badge}`);
-    const text = nextBody === current ? `✓ Moved · ${badge}\n\n${current}` : nextBody;
+    const text = `✅ به «${STATUS_LABEL[newStatus]}» منتقل شد.\n\n${current}`;
     await ctx.editMessageText(text, {
       parse_mode: 'Markdown',
       reply_markup: postSaveKeyboard(cardId, newStatus),
@@ -1681,12 +1930,12 @@ async function handleKnowledgeCommand(
 ): Promise<void> {
   if (cmd.cmd === 'save') {
     if ('error' in cmd) {
-      await ctx.reply('Usage: `/save <url> [| title]`', { parse_mode: 'Markdown' });
+      await ctx.reply('روش استفاده: `/save <پیوند> [| عنوان]`', { parse_mode: 'Markdown' });
       return;
     }
     let placeholder;
     try {
-      placeholder = await ctx.reply(`🔗 Saving ${new URL(cmd.url).hostname}...`);
+      placeholder = await ctx.reply(`🔗 در حال ذخیرهٔ ${new URL(cmd.url).hostname}...`);
     } catch {
       placeholder = null;
     }
@@ -1707,16 +1956,16 @@ async function handleKnowledgeCommand(
       setTimeout(async () => {
         const updated = await loadKnowledge(k.id);
         const buttons = new InlineKeyboard()
-          .text('👥 Share with family', `kshare:${k.id}`)
+          .text('👥 اشتراک‌گذاری با گروه', `kshare:${k.id}`)
           .row()
-          .text('🏷 Tag', `ktag:${k.id}`)
-          .text('🗑 Discard', `karchive:${k.id}`);
+          .text('🏷 برچسب', `ktag:${k.id}`)
+          .text('🗑 بایگانی', `karchive:${k.id}`);
         const txt =
           updated?.fetch_status === 'ok'
-            ? `✓ Saved · ${updated.title}`
+            ? `✓ «${updated.title}» ذخیره شد.`
             : updated?.fetch_status === 'failed'
-              ? `⚠ Saved (no preview): ${updated.fetch_error ?? 'fetch failed'}`
-              : `✓ Saved (still fetching) · ${k.title}`;
+              ? '⚠ ذخیره شد، اما دریافت پیش‌نمایش ناموفق بود.'
+              : `✓ «${k.title}» ذخیره شد؛ دریافت محتوا ادامه دارد.`;
         if (placeholder && chatId) {
           await ctx.api
             .editMessageText(chatId, placeholder.message_id, txt, { reply_markup: buttons })
@@ -1726,9 +1975,7 @@ async function handleKnowledgeCommand(
         }
       }, 4000);
     } catch (e) {
-      const msg =
-        e instanceof KnowledgeValidationError ? e.message : (e as Error).message;
-      const errText = `Cannot save: ${msg}`;
+      const errText = `ذخیره ممکن نشد: ${knowledgeErrorText(e)}`;
       if (placeholder && chatId) {
         await ctx.api.editMessageText(chatId, placeholder.message_id, errText).catch(() => {});
       } else {
@@ -1740,7 +1987,7 @@ async function handleKnowledgeCommand(
 
   if (cmd.cmd === 'note') {
     if ('error' in cmd) {
-      await ctx.reply('Usage: `/note <body>`', { parse_mode: 'Markdown' });
+      await ctx.reply('روش استفاده: `/note <متن یادداشت>`', { parse_mode: 'Markdown' });
       return;
     }
     try {
@@ -1752,22 +1999,23 @@ async function handleKnowledgeCommand(
         auto_fetch: false,
       });
       broadcast({ type: 'knowledge.created', knowledge: k });
-      await ctx.reply(`✓ Note saved · ${k.title}`);
+      await ctx.reply(`✓ یادداشت «${k.title}» ذخیره شد.`, {
+        reply_markup: new InlineKeyboard().text('🏷 برچسب', `ktag:${k.id}`),
+      });
     } catch (e) {
-      const msg = e instanceof KnowledgeValidationError ? e.message : (e as Error).message;
-      await ctx.reply(`Cannot save note: ${msg}`);
+      await ctx.reply(`ذخیرهٔ یادداشت ممکن نشد: ${knowledgeErrorText(e)}`);
     }
     return;
   }
 
   if (cmd.cmd === 'k') {
     if ('error' in cmd) {
-      await ctx.reply('Usage: `/k <query>`', { parse_mode: 'Markdown' });
+      await ctx.reply('روش استفاده: `/k <عبارت جست‌وجو>`', { parse_mode: 'Markdown' });
       return;
     }
     const items = await listKnowledge(createdBy, { q: cmd.q, scope: 'all', limit: 5 });
     if (items.length === 0) {
-      await ctx.reply('Nothing matched.');
+      await ctx.reply('موردی پیدا نشد.');
       return;
     }
     const lines = items
@@ -1785,7 +2033,7 @@ async function handleKnowledgeCommand(
   if (cmd.cmd === 'klist') {
     const items = await listKnowledge(createdBy, { scope: 'all', limit: 10 });
     if (items.length === 0) {
-      await ctx.reply('No knowledge yet.');
+      await ctx.reply('هنوز موردی در دانش ذخیره نشده است.');
       return;
     }
     const lines = items
@@ -1807,6 +2055,17 @@ function linkLabelEmoji(label: CardLinkLabel): string {
     case 'related':      return '🔗';
     case 'inspired_by':  return '💡';
     case 'duplicate_of': return '👯';
+  }
+}
+
+function linkLabelText(label: CardLinkLabel): string {
+  switch (label) {
+    case 'evolves_from': return 'تکامل‌یافته از';
+    case 'supersedes': return 'جایگزینِ';
+    case 'split_from': return 'جداشده از';
+    case 'related': return 'مرتبط با';
+    case 'inspired_by': return 'الهام‌گرفته از';
+    case 'duplicate_of': return 'تکراریِ';
   }
 }
 
@@ -1836,16 +2095,16 @@ async function showLinkPicker(
     cards = rows;
   }
   if (cards.length === 0) {
-    const kb = new InlineKeyboard().text('❌ Cancel', `drop:${pending.id}`);
-    await ctx.reply('No cards to link. Reply with different words or Cancel.', { reply_markup: kb });
+    const kb = new InlineKeyboard().text('❌ لغو', `drop:${pending.id}`);
+    await ctx.reply('کاری برای پیوند پیدا نشد. واژه‌های دیگری بفرست یا لغو کن.', { reply_markup: kb });
     return;
   }
   const kb = new InlineKeyboard();
   for (const c of cards) {
-    kb.text(`Pick: ${c.title.slice(0, 40)}`, `linkto:${c.id}:${pending.id}`).row();
+    kb.text(`انتخاب: ${c.title.slice(0, 40)}`, `linkto:${c.id}:${pending.id}`).row();
   }
-  kb.text('❌ Cancel', `drop:${pending.id}`);
-  await ctx.reply('Pick a card to link to (or reply with words to filter):', { reply_markup: kb });
+  kb.text('❌ لغو', `drop:${pending.id}`);
+  await ctx.reply('کاری را برای پیوند انتخاب کن یا برای فیلتر چند واژه بفرست:', { reply_markup: kb });
 }
 
 async function finalizeCardWithLink(
@@ -1855,13 +2114,18 @@ async function finalizeCardWithLink(
 ): Promise<void> {
   const status: Status = 'inbox';
   if (pending.destination === 'knowledge') {
-    await ctx.reply('Linking is only available for card destinations. Pick Private or Public first.');
+    await ctx.reply('پیوند فقط برای مقصدهای کار در دسترس است. ابتدا «شخصی» یا «گروه» را انتخاب کن.');
     deletePending(pending.id);
     return;
   }
   if (!pending.pendingLinkTargetId || !pending.pendingLinkLabel) {
-    await ctx.reply('Missing link target or label. Restart the flow.');
+    await ctx.reply('مقصد یا نوع پیوند مشخص نیست. روند را دوباره شروع کن.');
     deletePending(pending.id);
+    return;
+  }
+  if (pending.destination !== 'private_card' && allowedGroupId() !== null &&
+      !(await hasTelegramWorkflowTopic(status, pending.taskWorkType ?? 'chore'))) {
+    await ctx.reply(`ابتدا تاپیک «${pending.taskWorkType === 'bug' ? ROUTE_LABEL.bugs : STATUS_LABEL[status]}» را به بات وصل کن.`);
     return;
   }
 
@@ -1902,17 +2166,28 @@ async function finalizeCardWithLink(
   deletePending(pending.id);
 
   const target = await loadCard(pending.pendingLinkTargetId);
-  const noteLine = noteText ? `\n   note: "${noteText.slice(0, 80)}"` : '';
+  const noteLine = noteText ? `\n   یادداشت: «${noteText.slice(0, 80)}»` : '';
   const card = await loadCard(cardId);
-  await ctx.reply(
-    `✓ Saved · ${STATUS_EMOJI[status]} ${STATUS_LABEL[status]} — ${pending.proposal.title}\n🔗 ${pending.pendingLinkLabel} "${target?.title ?? '(unknown)'}"${noteLine}`,
-    {
-      reply_markup: card ? postSaveKeyboard(cardId, status) : undefined,
-    },
-  );
   if (card) {
     broadcast({ type: 'card.created', card });
-    if (pending.taskSourceMessageId !== undefined) await projectCardToTopic(cardId);
+  }
+  const routeKey = pending.taskWorkType === 'bug' ? 'bugs' : status;
+  const isPrivate = pending.destination === 'private_card';
+  const groupConfigured = allowedGroupId() !== null;
+  const projected = !isPrivate && groupConfigured ? await projectCardToTopic(cardId) : false;
+  if (isPrivate) {
+    await ctx.reply(
+      pending.isPrivateChat
+        ? `✅ کار «${pending.proposal.title}» در کارهای شخصی ثبت شد.\n🔗 ${linkLabelText(pending.pendingLinkLabel)} «${target?.title ?? 'نامشخص'}»${noteLine}`
+        : '✅ کار خصوصی در کارهای شخصی شما ثبت شد.',
+      { reply_markup: card && pending.isPrivateChat ? postSaveKeyboard(cardId, status) : undefined },
+    );
+  } else {
+    await ctx.reply(!groupConfigured
+      ? '✅ کار ثبت شد؛ گروه تلگرام برای انتشار در تاپیک تنظیم نشده است.'
+      : projected
+        ? `✅ کار به تاپیک «${ROUTE_LABEL[routeKey]}» اضافه شد و به مورد انتخابی پیوند خورد.`
+        : `✅ کار ثبت شد؛ فرستادن آن به تاپیک «${ROUTE_LABEL[routeKey]}» در صف است.`);
   }
 }
 
@@ -1922,9 +2197,9 @@ export function buildBot(token: string): Bot {
   bot.on('callback_query:data', async (ctx, next) => {
     try {
       if (await handlePostSaveCallback(ctx)) return;
-    } catch {
+    } catch (error) {
       try {
-        await ctx.answerCallbackQuery({ text: 'error' });
+        await ctx.answerCallbackQuery({ text: workflowErrorText(error), show_alert: true });
       } catch {}
       return;
     }
@@ -1936,40 +2211,42 @@ export function buildBot(token: string): Bot {
     const tgId = ctx.from.id;
     const userId = await resolveAppUser(tgId);
     if (!userId) {
-      await ctx.answerCallbackQuery({ text: 'Link your Telegram identity first.' });
+      await ctx.answerCallbackQuery({ text: 'ابتدا حساب تلگرامت را پیوند بده.' });
       return;
     }
     const k = await loadKnowledge(id);
     if (!k) {
-      await ctx.answerCallbackQuery({ text: 'Item not found.' });
+      await ctx.answerCallbackQuery({ text: 'مورد پیدا نشد.' });
       return;
     }
     if (!(await canUserSeeKnowledge(userId, k))) {
-      await ctx.answerCallbackQuery({ text: 'Not visible.' });
+      await ctx.answerCallbackQuery({ text: 'به این مورد دسترسی نداری.' });
       return;
     }
     const body = (k.body || '').slice(0, 4000);
     await ctx.answerCallbackQuery();
-    await ctx.reply(`${k.title}\n\n${body}${(k.body ?? '').length > 4000 ? '\n...' : ''}`);
+    await ctx.reply(`${k.title}\n\n${body}${(k.body ?? '').length > 4000 ? '\n...' : ''}`, {
+      reply_markup: k.owner_id === userId ? new InlineKeyboard().text('🏷 برچسب', `ktag:${id}`) : undefined,
+    });
   });
 
   bot.callbackQuery(/^kshare:/, async (ctx) => {
     const id = ctx.callbackQuery.data.slice('kshare:'.length);
     const userId = await resolveAppUser(ctx.from.id);
     if (!userId) {
-      await ctx.answerCallbackQuery({ text: 'Link your Telegram identity first.' });
+      await ctx.answerCallbackQuery({ text: 'ابتدا حساب تلگرامت را پیوند بده.' });
       return;
     }
     try {
       const updated = await updateKnowledge(userId, id, { visibility: 'inbox' });
       if (!updated) {
-        await ctx.answerCallbackQuery({ text: 'Not found.' });
+        await ctx.answerCallbackQuery({ text: 'مورد پیدا نشد.' });
         return;
       }
       broadcast({ type: 'knowledge.updated', knowledge: updated });
-      await ctx.answerCallbackQuery({ text: 'Shared with family.' });
+      await ctx.answerCallbackQuery({ text: 'با گروه به اشتراک گذاشته شد.' });
     } catch {
-      await ctx.answerCallbackQuery({ text: 'Cannot change visibility.' });
+      await ctx.answerCallbackQuery({ text: 'تغییر دسترسی ممکن نشد.' });
     }
   });
 
@@ -1977,17 +2254,17 @@ export function buildBot(token: string): Bot {
     const id = ctx.callbackQuery.data.slice('karchive:'.length);
     const userId = await resolveAppUser(ctx.from.id);
     if (!userId) {
-      await ctx.answerCallbackQuery({ text: 'Link your Telegram identity first.' });
+      await ctx.answerCallbackQuery({ text: 'ابتدا حساب تلگرامت را پیوند بده.' });
       return;
     }
     const k = await loadKnowledge(id);
     if (!k) {
-      await ctx.answerCallbackQuery({ text: 'Not found.' });
+      await ctx.answerCallbackQuery({ text: 'مورد پیدا نشد.' });
       return;
     }
     const ok = await archiveKnowledge(userId, id);
     if (!ok) {
-      await ctx.answerCallbackQuery({ text: 'Forbidden.' });
+      await ctx.answerCallbackQuery({ text: 'اجازهٔ انجام این کار را نداری.' });
       return;
     }
     broadcast({
@@ -1997,13 +2274,45 @@ export function buildBot(token: string): Bot {
       visibility: k.visibility,
       shares: k.shares ?? [],
     });
-    await ctx.answerCallbackQuery({ text: 'Archived.' });
+    await ctx.answerCallbackQuery({ text: 'بایگانی شد.' });
+  });
+
+  bot.callbackQuery(/^ctag:/, async (ctx) => {
+    const id = ctx.callbackQuery.data.slice('ctag:'.length);
+    const userId = await resolveAppUser(ctx.from.id);
+    if (!userId) {
+      await ctx.answerCallbackQuery({ text: 'ابتدا حساب تلگرامت را پیوند بده.' });
+      return;
+    }
+    const card = await loadCard(id);
+    if (!card || !(await canUserSeeCard(userId, id))) {
+      await ctx.answerCallbackQuery({ text: 'این کار پیدا نشد یا به آن دسترسی نداری.' });
+      return;
+    }
+    pendingTagTargets.set(ctx.from.id, { kind: 'card', id, chatId: ctx.chat?.id, createdAt: Date.now() });
+    await ctx.answerCallbackQuery({ text: 'حالا دستور /tag را همراه برچسب‌ها بفرست.' });
+    const message = ctx.callbackQuery.message;
+    const threadId = message && 'message_thread_id' in message ? message.message_thread_id : undefined;
+    await sendToChatTopic(ctx.chat?.id, threadId, `برای افزودن برچسب به «${card.title}»، همین‌جا بنویس: /tag فوری، رابط کاربری`);
   });
 
   bot.callbackQuery(/^ktag:/, async (ctx) => {
-    await ctx.answerCallbackQuery({
-      text: 'Reply to the saved message with #tag #tag — coming soon.',
-    });
+    const id = ctx.callbackQuery.data.slice('ktag:'.length);
+    const userId = await resolveAppUser(ctx.from.id);
+    if (!userId) {
+      await ctx.answerCallbackQuery({ text: 'ابتدا حساب تلگرامت را پیوند بده.' });
+      return;
+    }
+    const item = await loadKnowledge(id);
+    if (!item || item.owner_id !== userId) {
+      await ctx.answerCallbackQuery({ text: 'این مورد دانش پیدا نشد یا اجازهٔ ویرایشش را نداری.' });
+      return;
+    }
+    pendingTagTargets.set(ctx.from.id, { kind: 'knowledge', id, chatId: ctx.chat?.id, createdAt: Date.now() });
+    await ctx.answerCallbackQuery({ text: 'حالا دستور /tag را همراه برچسب‌ها بفرست.' });
+    const message = ctx.callbackQuery.message;
+    const threadId = message && 'message_thread_id' in message ? message.message_thread_id : undefined;
+    await sendToChatTopic(ctx.chat?.id, threadId, `برای افزودن برچسب به «${item.title}»، همین‌جا بنویس: /tag مرجع، مطالعه`);
   });
 
   // ---------- structured-capture callbacks ----------
@@ -2011,37 +2320,42 @@ export function buildBot(token: string): Bot {
   bot.callbackQuery(/^capture:ai:([^:]+)$/, async (ctx) => {
     const pending = getPending(ctx.match![1]!);
     if (!pending) {
-      await ctx.answerCallbackQuery({ text: 'Session expired. Send the task again.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'مهلت این درخواست تمام شده؛ کار را دوباره بفرست.', show_alert: true });
       return;
     }
     if (ctx.from.id !== pending.tgUserId) {
-      await ctx.answerCallbackQuery({ text: 'Only the sender can choose this.' });
+      await ctx.answerCallbackQuery({ text: 'فقط فرستنده می‌تواند این گزینه را انتخاب کند.' });
       return;
     }
-    await ctx.answerCallbackQuery({ text: 'Sending this request to OpenAI…' });
+    await ctx.answerCallbackQuery({ text: 'در حال فرستادن درخواست برای پردازش هوش مصنوعی…' });
     await captureWithAI(ctx, pending);
   });
 
   bot.callbackQuery(/^capture:manual:([^:]+)$/, async (ctx) => {
     const pending = getPending(ctx.match![1]!);
     if (!pending) {
-      await ctx.answerCallbackQuery({ text: 'Session expired. Send the task again.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'مهلت این درخواست تمام شده؛ کار را دوباره بفرست.', show_alert: true });
       return;
     }
     if (ctx.from.id !== pending.tgUserId) {
-      await ctx.answerCallbackQuery({ text: 'Only the sender can choose this.' });
+      await ctx.answerCallbackQuery({ text: 'فقط فرستنده می‌تواند این گزینه را انتخاب کند.' });
       return;
     }
     await ctx.answerCallbackQuery();
     const media = pending.captureType === 'photo' || pending.captureType === 'voice';
     if (media && !pending.manualText?.trim()) {
       updatePending(pending.id, { awaitingManual: true, aiSummarized: false });
-      const message = await ctx.reply('Reply to this message with the task title and any details. I will save it without AI.');
+      const prompt = 'به این پیام پاسخ بده و عنوان و جزئیات کار را بنویس. آن را بدون هوش مصنوعی ذخیره می‌کنم.';
+      const message = pending.taskSourceMessageId !== undefined && !pending.isPrivateChat
+        ? await ctx.api.sendMessage(pending.chatId, prompt, {
+          ...(pending.taskSourceThreadId ? { message_thread_id: pending.taskSourceThreadId } : {}),
+        })
+        : await ctx.reply(prompt);
       updatePending(pending.id, { promptMessageId: message.message_id });
       return;
     }
     const proposal = plainProposal(pending.manualText ?? pending.original,
-      pending.captureType === 'photo' ? 'Photo task' : pending.captureType === 'voice' ? 'Voice task' : 'New task');
+      pending.captureType === 'photo' ? 'کار از تصویر' : pending.captureType === 'voice' ? 'کار از پیام صوتی' : 'کار جدید');
     updatePending(pending.id, { proposal, aiSummarized: false, awaitingManual: false });
     if (media) {
       await sendMediaAttachmentChoice(ctx, pending);
@@ -2054,18 +2368,18 @@ export function buildBot(token: string): Bot {
   bot.callbackQuery(/^capture:edit-ai:([^:]+)$/, async (ctx) => {
     const pending = getPending(ctx.match![1]!);
     if (!pending || !pending.correction) {
-      await ctx.answerCallbackQuery({ text: 'Correction expired. Edit the task again.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'مهلت اصلاحیه تمام شده؛ کار را دوباره ویرایش کن.', show_alert: true });
       return;
     }
     if (ctx.from.id !== pending.tgUserId) {
-      await ctx.answerCallbackQuery({ text: 'Only the sender can choose this.' });
+      await ctx.answerCallbackQuery({ text: 'فقط فرستنده می‌تواند این گزینه را انتخاب کند.' });
       return;
     }
     if (!AI_ENABLED()) {
-      await ctx.answerCallbackQuery({ text: 'OpenAI is not configured.' });
+      await ctx.answerCallbackQuery({ text: 'هوش مصنوعی تنظیم نشده است.' });
       return;
     }
-    await ctx.answerCallbackQuery({ text: 'Sending your correction to OpenAI…' });
+    await ctx.answerCallbackQuery({ text: 'در حال فرستادن اصلاحیه برای پردازش هوش مصنوعی…' });
     let revised: AIProposal | null = null;
     try {
       revised = await proposeFromText(pending.original, pending.proposal, pending.correction, pending.contextSnippets);
@@ -2073,7 +2387,7 @@ export function buildBot(token: string): Bot {
       console.error('[telegram] requested AI correction failed:', error);
     }
     if (!revised) {
-      await ctx.reply('OpenAI could not apply that correction. You can choose “Use correction as written” on the previous prompt.');
+      await ctx.reply('هوش مصنوعی نتوانست اصلاحیه را اعمال کند. می‌توانی روی پیام قبلی «استفاده از همین متن» را انتخاب کنی.');
       return;
     }
     updatePending(pending.id, { proposal: revised, correction: undefined, aiSummarized: true });
@@ -2084,11 +2398,11 @@ export function buildBot(token: string): Bot {
   bot.callbackQuery(/^capture:edit-manual:([^:]+)$/, async (ctx) => {
     const pending = getPending(ctx.match![1]!);
     if (!pending || !pending.correction) {
-      await ctx.answerCallbackQuery({ text: 'Correction expired. Edit the task again.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'مهلت اصلاحیه تمام شده؛ کار را دوباره ویرایش کن.', show_alert: true });
       return;
     }
     if (ctx.from.id !== pending.tgUserId) {
-      await ctx.answerCallbackQuery({ text: 'Only the sender can choose this.' });
+      await ctx.answerCallbackQuery({ text: 'فقط فرستنده می‌تواند این گزینه را انتخاب کند.' });
       return;
     }
     await ctx.answerCallbackQuery();
@@ -2102,39 +2416,39 @@ export function buildBot(token: string): Bot {
     const pid = ctx.match![1]!;
     const pending = getPending(pid);
     if (!pending) {
-      await ctx.answerCallbackQuery({ text: 'Session expired. Send your message again.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'مهلت این درخواست تمام شده؛ پیام را دوباره بفرست.', show_alert: true });
       return;
     }
     if (ctx.from?.id !== pending.tgUserId) {
-      await ctx.answerCallbackQuery({ text: 'Only the sender can act on this proposal.' });
+      await ctx.answerCallbackQuery({ text: 'فقط فرستنده می‌تواند این پیش‌نویس را تغییر دهد.' });
       return;
     }
     updatePending(pid, { awaitingEdit: true });
     try {
       await ctx.editMessageText(
-        `${proposalText(pending.proposal, pending.links)}\n\n✏️ _Reply to this message with your correction. I will ask before sending it to OpenAI._`,
+        `${pending.isPrivateChat ? proposalText(pending.proposal, pending.links) : 'پیش‌نویس آماده است.'}\n\n✏️ _برای اصلاح، به این پیام پاسخ بده. پیش از فرستادن متن به هوش مصنوعی از تو اجازه می‌گیرم._`,
         { parse_mode: 'Markdown', reply_markup: undefined },
       );
     } catch {}
-    await ctx.answerCallbackQuery({ text: 'Send your correction' });
+    await ctx.answerCallbackQuery({ text: 'اصلاحیه‌ات را بفرست.' });
   });
 
   bot.callbackQuery(/^drop:([^:]+)$/, async (ctx) => {
     const pid = ctx.match![1]!;
     const pending = getPending(pid);
     if (!pending) {
-      await ctx.answerCallbackQuery({ text: 'Already gone.' });
+      await ctx.answerCallbackQuery({ text: 'این درخواست دیگر وجود ندارد.' });
       return;
     }
     if (ctx.from?.id !== pending.tgUserId) {
-      await ctx.answerCallbackQuery({ text: 'Only the sender can act on this proposal.' });
+      await ctx.answerCallbackQuery({ text: 'فقط فرستنده می‌تواند این پیش‌نویس را تغییر دهد.' });
       return;
     }
     deletePending(pid);
     try {
-      await ctx.editMessageText('❌ Discarded.', { reply_markup: undefined });
+      await ctx.editMessageText('❌ درخواست لغو شد.', { reply_markup: undefined });
     } catch {}
-    await ctx.answerCallbackQuery({ text: 'Discarded' });
+    await ctx.answerCallbackQuery({ text: 'لغو شد.' });
   });
 
   bot.callbackQuery(/^dest:(private_card|public_card|knowledge):([^:]+)$/, async (ctx) => {
@@ -2142,7 +2456,7 @@ export function buildBot(token: string): Bot {
     const pid = ctx.match![2]!;
     const pending = getPending(pid);
     if (!pending) {
-      await ctx.answerCallbackQuery({ text: 'Session expired. Send your message again.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'مهلت این درخواست تمام شده؛ پیام را دوباره بفرست.', show_alert: true });
       return;
     }
     updatePending(pid, { destination: dest });
@@ -2151,21 +2465,35 @@ export function buildBot(token: string): Bot {
       await finalizeKnowledge(ctx, pending);
       return;
     }
+    if (dest === 'private_card') {
+      try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch {}
+      await finalizeCard(ctx, pending, 'inbox');
+      return;
+    }
     try {
       await ctx.editMessageReplyMarkup({ reply_markup: columnKeyboard(pid) });
-      await ctx.reply('Which column?');
+      await ctx.reply('این کار در کدام تاپیک باشد؟');
     } catch { /* edit non-fatal */ }
   });
 
-  bot.callbackQuery(/^col:(inbox):([^:]+)$/, async (ctx) => {
+  bot.callbackQuery(/^col:(inbox|in_progress):([^:]+)$/, async (ctx) => {
     const status = ctx.match![1] as Status;
     const pid = ctx.match![2]!;
     const pending = getPending(pid);
     if (!pending) {
-      await ctx.answerCallbackQuery({ text: 'Session expired.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'مهلت این درخواست تمام شده است.', show_alert: true });
+      return;
+    }
+    const workType = pending.taskWorkType ?? 'chore';
+    if (!(await hasTelegramWorkflowTopic(status, workType))) {
+      await ctx.answerCallbackQuery({
+        text: `تاپیک «${STATUS_LABEL[status]}» هنوز به بات وصل نشده است.`,
+        show_alert: true,
+      });
       return;
     }
     await ctx.answerCallbackQuery();
+    try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch {}
     await finalizeCard(ctx, pending, status);
   });
 
@@ -2173,10 +2501,10 @@ export function buildBot(token: string): Bot {
     const pid = ctx.match![1]!;
     const pending = getPending(pid);
     if (!pending) {
-      await ctx.answerCallbackQuery({ text: 'Session expired.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'مهلت این درخواست تمام شده است.', show_alert: true });
       return;
     }
-    await ctx.answerCallbackQuery({ text: 'Scanning…' });
+    await ctx.answerCallbackQuery({ text: 'در حال جست‌وجو…' });
     await runDuplicateCheck(ctx, pending);
   });
 
@@ -2191,13 +2519,13 @@ export function buildBot(token: string): Bot {
     const pid = ctx.match![3]!;
     const pending = getPending(pid);
     if (!pending) {
-      await ctx.answerCallbackQuery({ text: 'Session expired.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'مهلت این درخواست تمام شده است.', show_alert: true });
       return;
     }
     await ctx.answerCallbackQuery();
     try {
       if (kind === 'card') {
-        await postCardMessage(id, pending.appUserId, `[telegram dup] ${pending.original}`);
+        await postCardMessage(id, pending.appUserId, `[تکراری تلگرام] ${pending.original}`);
         await pool.query(`UPDATE cards SET updated_at = now() WHERE id = $1`, [id]);
         await logActivity(pending.appUserId, id, 'telegram.dup.linked', {
           original: pending.original.slice(0, 500),
@@ -2205,23 +2533,23 @@ export function buildBot(token: string): Bot {
         const card = await loadCard(id);
         if (card) {
           broadcast({ type: 'card.updated', card });
-          await ctx.reply(`🔗 Merged into "${card.title}" — last interaction now.`);
+          await ctx.reply(`🔗 به کار «${card.title}» پیوند خورد؛ زمان آخرین فعالیت به‌روز شد.`);
         } else {
-          await ctx.reply('🔗 Merged into existing card.');
+          await ctx.reply('🔗 به کار موجود پیوند خورد.');
         }
       } else {
         await pool.query(`UPDATE knowledge_items SET updated_at = now() WHERE id = $1`, [id]);
         const knowledge = await loadKnowledge(id);
         if (knowledge) {
           broadcast({ type: 'knowledge.updated', knowledge });
-          await ctx.reply(`🔗 Touched "${knowledge.title}" — last interaction now.`);
+          await ctx.reply(`🔗 به دانش «${knowledge.title}» پیوند خورد؛ زمان آخرین فعالیت به‌روز شد.`);
         } else {
-          await ctx.reply('🔗 Merged into existing knowledge item.');
+          await ctx.reply('🔗 به مورد دانش موجود پیوند خورد.');
         }
       }
     } catch (err) {
       console.error('[telegram] dup:link failed:', err);
-      await ctx.reply('Could not merge into existing item.');
+      await ctx.reply('پیوند به مورد موجود انجام نشد.');
     }
     deletePending(pid);
   });
@@ -2234,7 +2562,7 @@ export function buildBot(token: string): Bot {
     const pid = ctx.match![3]!;
     const pending = getPending(pid);
     if (!pending) {
-      await ctx.answerCallbackQuery({ text: 'Session expired.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'مهلت این درخواست تمام شده است.', show_alert: true });
       return;
     }
     await ctx.answerCallbackQuery();
@@ -2245,23 +2573,23 @@ export function buildBot(token: string): Bot {
         const card = await loadCard(id);
         if (card) {
           broadcast({ type: 'card.updated', card });
-          await ctx.reply(`👁 "${card.title}" — last interaction now.`);
+          await ctx.reply(`👁 کار «${card.title}» قبلاً وجود داشت؛ زمان آخرین فعالیت به‌روز شد.`);
         } else {
-          await ctx.reply('👁 Touched existing card.');
+          await ctx.reply('👁 فعالیت کار موجود به‌روز شد.');
         }
       } else {
         await pool.query(`UPDATE knowledge_items SET updated_at = now() WHERE id = $1`, [id]);
         const knowledge = await loadKnowledge(id);
         if (knowledge) {
           broadcast({ type: 'knowledge.updated', knowledge });
-          await ctx.reply(`👁 "${knowledge.title}" — last interaction now.`);
+          await ctx.reply(`👁 مورد دانش «${knowledge.title}» قبلاً وجود داشت؛ زمان آخرین فعالیت به‌روز شد.`);
         } else {
-          await ctx.reply('👁 Touched existing knowledge item.');
+          await ctx.reply('👁 فعالیت مورد دانش موجود به‌روز شد.');
         }
       }
     } catch (err) {
       console.error('[telegram] dup:touch failed:', err);
-      await ctx.reply('Could not touch existing item.');
+      await ctx.reply('به‌روزرسانی فعالیت مورد موجود انجام نشد.');
     }
     deletePending(pid);
   });
@@ -2270,7 +2598,7 @@ export function buildBot(token: string): Bot {
     const pid = ctx.match![1]!;
     const pending = getPending(pid);
     if (!pending) {
-      await ctx.answerCallbackQuery({ text: 'Session expired.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'مهلت این درخواست تمام شده است.', show_alert: true });
       return;
     }
     await ctx.answerCallbackQuery();
@@ -2290,11 +2618,11 @@ export function buildBot(token: string): Bot {
     const pid = ctx.match![1]!;
     const pending = getPending(pid);
     if (!pending) {
-      await ctx.answerCallbackQuery({ text: 'Session expired.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'مهلت این درخواست تمام شده است.', show_alert: true });
       return;
     }
     if (ctx.from?.id !== pending.tgUserId) {
-      await ctx.answerCallbackQuery({ text: 'Not your prompt.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'این درخواست برای تو نیست.', show_alert: true });
       return;
     }
     updatePending(pid, { attachMode: 'new' });
@@ -2312,11 +2640,11 @@ export function buildBot(token: string): Bot {
     const pid = ctx.match![1]!;
     const pending = getPending(pid);
     if (!pending) {
-      await ctx.answerCallbackQuery({ text: 'Session expired.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'مهلت این درخواست تمام شده است.', show_alert: true });
       return;
     }
     if (ctx.from?.id !== pending.tgUserId) {
-      await ctx.answerCallbackQuery({ text: 'Not your prompt.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'این درخواست برای تو نیست.', show_alert: true });
       return;
     }
     await ctx.answerCallbackQuery();
@@ -2330,11 +2658,11 @@ export function buildBot(token: string): Bot {
     const pid = ctx.match![3]!;
     const pending = getPending(pid);
     if (!pending) {
-      await ctx.answerCallbackQuery({ text: 'Session expired.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'مهلت این درخواست تمام شده است.', show_alert: true });
       return;
     }
     if (ctx.from?.id !== pending.tgUserId) {
-      await ctx.answerCallbackQuery({ text: 'Not your prompt.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'این درخواست برای تو نیست.', show_alert: true });
       return;
     }
     await ctx.answerCallbackQuery();
@@ -2346,11 +2674,11 @@ export function buildBot(token: string): Bot {
     const pid = ctx.match![1]!;
     const pending = getPending(pid);
     if (!pending) {
-      await ctx.answerCallbackQuery({ text: 'Session expired.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'مهلت این درخواست تمام شده است.', show_alert: true });
       return;
     }
     if (ctx.from?.id !== pending.tgUserId) {
-      await ctx.answerCallbackQuery({ text: 'Not your prompt.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'این درخواست برای تو نیست.', show_alert: true });
       return;
     }
     await ctx.answerCallbackQuery();
@@ -2363,15 +2691,15 @@ export function buildBot(token: string): Bot {
     const pid = ctx.match![2]!;
     const pending = getPending(pid);
     if (!pending) {
-      await ctx.answerCallbackQuery({ text: 'Session expired.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'مهلت این درخواست تمام شده است.', show_alert: true });
       return;
     }
     if (ctx.from?.id !== pending.tgUserId) {
-      await ctx.answerCallbackQuery({ text: 'Not your prompt.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'این درخواست برای تو نیست.', show_alert: true });
       return;
     }
     if (!(await canUserSeeCard(pending.appUserId, targetId))) {
-      await ctx.answerCallbackQuery({ text: 'Card not visible to you.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'به این کار دسترسی نداری.', show_alert: true });
       return;
     }
     updatePending(pid, { pendingLinkTargetId: targetId });
@@ -2382,11 +2710,11 @@ export function buildBot(token: string): Bot {
       'evolves_from', 'supersedes', 'split_from', 'related', 'inspired_by', 'duplicate_of',
     ];
     labels.forEach((l, i) => {
-      kb.text(`${linkLabelEmoji(l)} ${l.replace(/_/g, ' ')}`, `linklabel:${l}:${pid}`);
+      kb.text(`${linkLabelEmoji(l)} ${linkLabelText(l)}`, `linklabel:${l}:${pid}`);
       if (i % 2 === 1) kb.row();
     });
     await ctx.reply(
-      `Link to "${target?.title ?? targetId}" — what kind of relationship?`,
+      `پیوند با «${target?.title ?? targetId}» از چه نوعی است؟`,
       { reply_markup: kb },
     );
   });
@@ -2397,17 +2725,17 @@ export function buildBot(token: string): Bot {
     const pid = ctx.match![2]!;
     const pending = getPending(pid);
     if (!pending) {
-      await ctx.answerCallbackQuery({ text: 'Session expired.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'مهلت این درخواست تمام شده است.', show_alert: true });
       return;
     }
     if (!isCardLinkLabel(labelStr)) {
-      await ctx.answerCallbackQuery({ text: 'Invalid label.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'نوع پیوند معتبر نیست.', show_alert: true });
       return;
     }
     updatePending(pid, { pendingLinkLabel: labelStr, awaitingLinkNote: true });
     await ctx.answerCallbackQuery();
-    const skipKb = new InlineKeyboard().text('Skip', `linknote:skip:${pid}`);
-    await ctx.reply('Add a note? Reply with text or tap Skip.', { reply_markup: skipKb });
+    const skipKb = new InlineKeyboard().text('رد شدن', `linknote:skip:${pid}`);
+    await ctx.reply('یادداشتی اضافه می‌کنی؟ پاسخ بده یا «رد شدن» را بزن.', { reply_markup: skipKb });
   });
 
   // linknote:skip:<pid>
@@ -2415,7 +2743,7 @@ export function buildBot(token: string): Bot {
     const pid = ctx.match![1]!;
     const pending = getPending(pid);
     if (!pending) {
-      await ctx.answerCallbackQuery({ text: 'Session expired.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'مهلت این درخواست تمام شده است.', show_alert: true });
       return;
     }
     await ctx.answerCallbackQuery();
@@ -2427,20 +2755,20 @@ export function buildBot(token: string): Bot {
     const cardId = ctx.match![1]!;
     const tgUserId = ctx.from?.id;
     if (!tgUserId) {
-      await ctx.answerCallbackQuery({ text: 'no user', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'کاربر شناسایی نشد.', show_alert: true });
       return;
     }
     const appUserId = await resolveAppUser(tgUserId, ctx.from?.username ?? undefined);
     if (!appUserId) {
-      await ctx.answerCallbackQuery({ text: 'Link your Telegram identity first.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'ابتدا حساب تلگرامت را پیوند بده.', show_alert: true });
       return;
     }
     if (!AI_ENABLED()) {
-      await ctx.answerCallbackQuery({ text: 'AI not configured.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'هوش مصنوعی تنظیم نشده است.', show_alert: true });
       return;
     }
     if (!(await canUserSeeCard(appUserId, cardId))) {
-      await ctx.answerCallbackQuery({ text: 'Card not visible to you.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'به این کار دسترسی نداری.', show_alert: true });
       return;
     }
     const [pendingCard, pendingUser, today] = await Promise.all([
@@ -2449,20 +2777,20 @@ export function buildBot(token: string): Bot {
       countTodayByUser(appUserId),
     ]);
     if (pendingCard >= 1) {
-      await ctx.answerCallbackQuery({ text: 'Already researching this card.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'در حال حاضر برای این کار پژوهشی در جریان است.', show_alert: true });
       return;
     }
     if (pendingUser >= 5) {
-      await ctx.answerCallbackQuery({ text: 'Too many pending — try later.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'چند درخواست در صف داری؛ کمی بعد دوباره امتحان کن.', show_alert: true });
       return;
     }
     if (today >= 50) {
-      await ctx.answerCallbackQuery({ text: 'Daily limit reached.', show_alert: true });
+      await ctx.answerCallbackQuery({ text: 'به سقف روزانه رسیده‌ای.', show_alert: true });
       return;
     }
     const insight = await createInsight(cardId, appUserId);
     enqueueBrainstorm(insight.id);
-    await ctx.answerCallbackQuery({ text: 'Research queued' });
+    await ctx.answerCallbackQuery({ text: 'درخواست پژوهش در صف قرار گرفت.' });
     // Strip the brainstorm button so it isn't re-tapped
     try {
       const card = await loadCard(cardId);
@@ -2470,7 +2798,7 @@ export function buildBot(token: string): Bot {
         await ctx.editMessageReplyMarkup({ reply_markup: postSaveKeyboard(cardId, card.status) });
       }
     } catch { /* edit non-fatal */ }
-    await ctx.reply('✓ Research queued — open card for results when ready.');
+    await ctx.reply('✓ درخواست پژوهش در صف است؛ برای دیدن نتیجه بعداً کارت را باز کن.');
   });
 
   bot.on('message', async (ctx, next) => {
@@ -2517,16 +2845,16 @@ export function buildBot(token: string): Bot {
       }
     } catch (e) {
       // Never drop user input silently: save a card with raw body if possible.
-      const raw = ctx.msg?.text ?? ctx.msg?.caption ?? '[telegram message — handler error]';
+      const raw = ctx.msg?.text ?? ctx.msg?.caption ?? '[پیام تلگرام — خطای پردازش]';
       const failedCommand = parseCommand(raw).command;
       if (failedCommand === 'task' || failedCommand === 'remember' || failedCommand === 'forget') {
         console.error('[telegram] command failed; not creating a fallback card:', e);
-        await ctx.reply('The command failed. If this was /task, check the board before retrying.');
+        await ctx.reply('دستور اجرا نشد. اگر /task بود، پیش از تلاش دوباره تخته را بررسی کن.');
         return;
       }
       const { tags, text: clean } = extractHashtags(raw);
       const cardId = await createCard({
-        title: splitTitleDesc(clean).title || '[telegram error]',
+        title: splitTitleDesc(clean).title || 'خطای پردازش تلگرام',
         description: splitTitleDesc(clean).description,
         tags,
         createdBy: appUserId,
@@ -2538,6 +2866,15 @@ export function buildBot(token: string): Bot {
       });
       const card = (await loadCard(cardId))!;
       broadcast({ type: 'card.created', card });
+      const groupConfigured = allowedGroupId() !== null;
+      const projected = !isPrivateChat && groupConfigured ? await projectCardToTopic(cardId) : false;
+      await ctx.reply(isPrivateChat
+        ? `کار «${card.title}» ذخیره شد و برای بازبینی علامت خورد.`
+        : !groupConfigured
+          ? 'کار ذخیره شد؛ گروه تلگرام برای انتشار در تاپیک تنظیم نشده است.'
+          : projected
+            ? `کار برای بازبینی در تاپیک «${STATUS_LABEL[card.status]}» ثبت شد.`
+            : `کار برای بازبینی ثبت شد؛ فرستادن آن به تاپیک «${STATUS_LABEL[card.status]}» در صف است.`);
     }
     return next();
   });
@@ -2599,7 +2936,7 @@ export async function sendBrainstormNudge(
   appUserId: string,
   cardTitle: string,
   status: 'ok' | 'failed',
-  error?: string,
+  _error?: string,
 ): Promise<void> {
   if (!botInstance) return;
   const { rows } = await pool.query<{ telegram_user_id: number }>(
@@ -2609,8 +2946,8 @@ export async function sendBrainstormNudge(
   const tgUserId = rows[0]?.telegram_user_id;
   if (!tgUserId) return;
   const text = status === 'ok'
-    ? `📚 Brainstorm done — ${cardTitle}`
-    : `⚠ Brainstorm failed: ${error?.slice(0, 100) ?? 'unknown error'} — try again from the card.`;
+    ? `📚 ایده‌پردازی برای «${cardTitle}» انجام شد.`
+    : '⚠ ایده‌پردازی ناموفق بود؛ از داخل کارت دوباره تلاش کن.';
   try {
     await botInstance.api.sendMessage(tgUserId, text);
   } catch { /* user blocked bot, etc. */ }

@@ -45,7 +45,8 @@ Instructions:
    - set_due_date: { "due_date": "YYYY-MM-DD" }
    - assign_user: { "user_id": "<uuid>" }
    - create_card: { "title": "...", "status": "inbox" }
-6. Be concise. Max 3 suggestions.`;
+6. Be concise. Max 3 suggestions.
+7. Reply in the language of the latest human message in the thread. If that message is Persian, write the reply and suggestion labels in Persian.`;
 }
 
 function parseSuggestions(raw: string): { text: string; suggestions: AiSuggestion[] | null } {
@@ -96,10 +97,10 @@ export async function processCardChatAI(
   });
 
   if (!rawReply) {
-    const errEvent = await postAiEvent(cardId, "Sorry, I couldn't reach the AI right now.", null);
+    const errEvent = await postAiEvent(cardId, 'الان نتوانستم به هوش مصنوعی وصل شوم.', null);
     const freshCard = await loadCard(cardId);
     if (freshCard) broadcast({ type: 'card.ai_response', event: errEvent, card_id: cardId, card: freshCard });
-    const errPreview = "Sorry, I couldn't reach the AI right now.";
+    const errPreview = 'الان نتوانستم به هوش مصنوعی وصل شوم.';
     fanOutNotification(cardId, Number(errEvent.id), null, 'AI Assistant', errPreview)
       .then(async (recipientIds) => {
         const pushPayload = { title: freshCard?.title ?? 'Card update', body: `AI: ${errPreview}`, cardId };

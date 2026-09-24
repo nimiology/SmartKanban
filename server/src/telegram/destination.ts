@@ -33,13 +33,13 @@ export function destinationOptions(
 ): Array<{ key: Destination; label: string }> {
   return isPrivateChat
     ? [
-        { key: 'private_card', label: '🔒 Private' },
-        { key: 'public_card', label: '👥 Public' },
-        { key: 'knowledge', label: '📚 Knowledge' },
+        { key: 'private_card', label: '🔒 شخصی' },
+        { key: 'public_card', label: '👥 گروه' },
+        { key: 'knowledge', label: '📚 دانش' },
       ]
     : [
-        { key: 'public_card', label: '👥 Inbox' },
-        { key: 'private_card', label: '🔒 Mine' },
-        { key: 'knowledge', label: '📚 Knowledge' },
+        { key: 'public_card', label: '👥 صندوق ورودی گروه' },
+        { key: 'private_card', label: '🔒 کارهای من' },
+        { key: 'knowledge', label: '📚 دانش' },
       ];
 }
