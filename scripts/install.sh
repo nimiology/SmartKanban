@@ -3,7 +3,7 @@
 # SmartKanban — installer / upgrade / uninstall / status
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/chatwithllm/SmartKanban/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/nimiology/SmartKanban/main/scripts/install.sh | bash
 #
 #   ./scripts/install.sh [server|client|install|upgrade|uninstall|status|-h|--help]
 #
@@ -144,7 +144,7 @@ ${C_BOLD}SmartKanban installer${C_RESET}
     ./scripts/install.sh explain
 
     # Via curl (non-interactive fresh server install with defaults)
-    curl -fsSL https://raw.githubusercontent.com/chatwithllm/SmartKanban/main/scripts/install.sh | bash
+    curl -fsSL https://raw.githubusercontent.com/nimiology/SmartKanban/main/scripts/install.sh | bash
 
 EOF
 }
@@ -185,7 +185,7 @@ detect_server_state() {
   # Must be a SmartKanban repo
   local remote_url
   remote_url="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
-  if [[ "$remote_url" != *"chatwithllm/SmartKanban"* ]]; then
+  if [[ "$remote_url" != *"nimiology/SmartKanban"* ]]; then
     echo "broken"
     return
   fi
@@ -337,10 +337,10 @@ resolve_bridge_dir() {
 wait_for_pg() {
   info "waiting for Postgres to be healthy…"
   for i in {1..30}; do
-    if $DOCKER compose ps db --format json 2>/dev/null | grep -q '"Health":"healthy"'; then
+    if compose_server ps db --format json 2>/dev/null | grep -q '"Health":"healthy"'; then
       ok "Postgres healthy"; return 0
     fi
-    if $DOCKER compose exec -T db pg_isready -U kanban >/dev/null 2>&1; then
+    if compose_server exec -T db pg_isready -U kanban >/dev/null 2>&1; then
       ok "Postgres ready (pg_isready)"; return 0
     fi
     sleep 2
@@ -348,10 +348,20 @@ wait_for_pg() {
   die "Postgres did not become healthy in 60s"
 }
 
+# Every server lifecycle command must use the production compose definition
+# and its explicit env file. Pin the project name so the production DB volume
+# is stable even if the checkout directory changes.
+compose_server() {
+  [[ -f "$INSTALL_DIR/server/.env" ]] || die "missing $INSTALL_DIR/server/.env"
+  [[ -f "$INSTALL_DIR/docker-compose.server.yml" ]] || die "missing production compose file in $INSTALL_DIR"
+  $DOCKER compose --project-name smartkanban --project-directory "$INSTALL_DIR" \
+    --env-file "$INSTALL_DIR/server/.env" -f "$INSTALL_DIR/docker-compose.server.yml" "$@"
+}
+
 wait_for_health() {
-  info "waiting for server to listen on 3001…"
+  info "waiting for server to listen on 7301…"
   for i in {1..30}; do
-    if /usr/bin/curl -sf http://localhost:3001/health >/dev/null 2>&1; then
+    if /usr/bin/curl -sf http://localhost:7301/health >/dev/null 2>&1; then
       ok "server healthy"; return 0
     fi
     sleep 2
@@ -399,26 +409,21 @@ do_status() {
     # Docker / container status
     if command -v docker >/dev/null 2>&1 || command -v sudo >/dev/null 2>&1; then
       resolve_docker 2>/dev/null || true
-      if [[ -f "$INSTALL_DIR/docker-compose.yml" || -f "$INSTALL_DIR/compose.yml" ]]; then
+      if [[ -f "$INSTALL_DIR/docker-compose.server.yml" && -f "$INSTALL_DIR/server/.env" ]]; then
         info ""
         info "  container status:"
-        local compose_file
-        if [[ -f "$INSTALL_DIR/docker-compose.yml" ]]; then
-          compose_file="$INSTALL_DIR/docker-compose.yml"
-        else
-          compose_file="$INSTALL_DIR/compose.yml"
-        fi
-        $DOCKER compose -f "$compose_file" --project-directory "$INSTALL_DIR" \
-          ps --format '{{.Service}}\t{{.State}}\t{{.Status}}' 2>/dev/null \
+        compose_server ps --format '{{.Service}}\t{{.State}}\t{{.Status}}' 2>/dev/null \
           || warn "  docker compose not reachable"
+      else
+        warn "  production compose/env missing; refusing to inspect a default Compose project"
       fi
     fi
 
     # Server health
-    if curl -sf http://localhost:3001/health >/dev/null 2>&1; then
-      ok "  server /health: $(curl -s http://localhost:3001/health)"
+    if curl -sf http://localhost:7301/health >/dev/null 2>&1; then
+      ok "  server /health: $(curl -s http://localhost:7301/health)"
     else
-      warn "  server not responding on http://localhost:3001/health"
+      warn "  server not responding on http://localhost:7301/health"
     fi
   fi
 
@@ -522,34 +527,39 @@ do_upgrade() {
     fi
     return 0
   fi
+  [[ "$state" == "behind" ]] || die "repository state is '$state'; refusing to overwrite local or divergent changes"
 
   resolve_docker
 
+  [[ -f "$INSTALL_DIR/docker-compose.server.yml" && -f "$INSTALL_DIR/server/.env" ]] \
+    || die "production compose/env missing at $INSTALL_DIR; refusing an unsafe upgrade"
+  if ! $DOCKER volume inspect smartkanban_kanban_server_pgdata >/dev/null 2>&1; then
+    die "expected production database volume smartkanban_kanban_server_pgdata is missing; refusing to create an empty database"
+  fi
+
   step "Pulling latest"
-  # fetch then hard-reset — unconditionally overwrites local changes
-  git -C "$INSTALL_DIR" fetch origin main
-  git -C "$INSTALL_DIR" reset --hard origin/main
+  git -C "$INSTALL_DIR" pull --ff-only origin main
   ok "repo updated to $(git -C "$INSTALL_DIR" rev-parse --short HEAD)"
 
   step "Applying schema + migrations (idempotent)"
   cd "$INSTALL_DIR"
   # Ensure db is running
-  $DOCKER compose up -d db
+  compose_server up -d db
   wait_for_pg
   # Migrations first so renames/alters run before schema's CREATE IF NOT EXISTS
   if compgen -G "server/migrations/*.sql" >/dev/null 2>&1; then
     for mig in $(ls server/migrations/*.sql | sort); do
-      $DOCKER compose exec -T db psql -U kanban -d kanban < "$mig" >/dev/null
+      compose_server exec -T db psql -U kanban -d kanban < "$mig" >/dev/null
     done
     ok "migrations applied"
   fi
-  $DOCKER compose exec -T db psql -U kanban -d kanban < server/schema.sql >/dev/null
+  compose_server exec -T db psql -U kanban -d kanban < server/schema.sql >/dev/null
   ok "schema applied"
 
   step "Rebuilding + restarting server"
-  $DOCKER compose up -d --build server
+  compose_server up -d --build server
   wait_for_health
-  ok "server healthy: $(curl -s http://localhost:3001/health)"
+  ok "server healthy: $(curl -s http://localhost:7301/health)"
 
   ok "Upgrade complete."
 
@@ -607,7 +617,7 @@ do_uninstall() {
 
   if ask_yn "Stop running containers (docker compose down)?" "y"; then
     if [[ -d "$INSTALL_DIR" ]]; then
-      ( cd "$INSTALL_DIR" && $DOCKER compose down ) || warn "docker compose down failed (containers may already be stopped)"
+      ( compose_server down ) || warn "docker compose down failed (containers may already be stopped)"
       ok "containers stopped"
     else
       warn "$INSTALL_DIR not found — skipping docker compose down"
@@ -615,7 +625,7 @@ do_uninstall() {
   fi
 
   if ask_yn "Remove database volume? THIS DELETES ALL CARDS." "n"; then
-    if $DOCKER volume rm "$(basename "$INSTALL_DIR")_db_data" 2>/dev/null; then
+    if $DOCKER volume rm smartkanban_kanban_server_pgdata 2>/dev/null; then
       ok "database volume removed"
     else
       warn "database volume not found or could not be removed"
@@ -644,8 +654,8 @@ do_uninstall() {
     fi
   else
     info "no Caddy site config found, skipping"
-    if [[ -f /etc/caddy/Caddyfile ]] && grep -q 'reverse_proxy localhost:3001' /etc/caddy/Caddyfile; then
-      warn "Caddyfile block for port 3001 detected — remove manually from /etc/caddy/Caddyfile"
+    if [[ -f /etc/caddy/Caddyfile ]] && grep -q 'reverse_proxy localhost:7301' /etc/caddy/Caddyfile; then
+      warn "Caddyfile block for port 7301 detected — remove manually from /etc/caddy/Caddyfile"
     fi
   fi
 
@@ -885,7 +895,7 @@ do_install() {
   else
     mkdir -p "$INSTALL_DIR"
     if [[ -z "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]]; then
-      git clone https://github.com/chatwithllm/SmartKanban.git "$INSTALL_DIR"
+      git clone https://github.com/nimiology/SmartKanban.git "$INSTALL_DIR"
       ok "cloned into $INSTALL_DIR"
     else
       die "$INSTALL_DIR exists, is not empty, and is not a git repo. Pick a different path."
@@ -921,6 +931,15 @@ do_install() {
   ENV_FILE="$INSTALL_DIR/server/.env"
   EXAMPLE_FILE="$INSTALL_DIR/.env.example"
 
+  resolve_docker
+  EXISTING_DB_PASSWORD=""
+  if [[ -f "$ENV_FILE" ]]; then
+    EXISTING_DB_PASSWORD="$(sed -n 's/^KANBAN_DB_PASSWORD=//p' "$ENV_FILE" | head -n 1)"
+  fi
+  if [[ -z "$EXISTING_DB_PASSWORD" ]] && $DOCKER volume inspect smartkanban_kanban_server_pgdata >/dev/null 2>&1; then
+    die "the production database volume exists but server/.env has no KANBAN_DB_PASSWORD; refusing to rotate or guess the database credential"
+  fi
+
   if [[ -f "$ENV_FILE" ]]; then
     if ! ask_yn "server/.env already exists — overwrite?" "n"; then
       info "keeping existing $ENV_FILE"
@@ -935,6 +954,7 @@ do_install() {
   if [[ "${SKIP_ENV:-false}" != "true" ]]; then
     APP_URL="$(ask "Public app URL (https://kanban.example.com or http://localhost:3001)" "http://localhost:3001")"
     COOKIE_SECRET="$(openssl rand -hex 32)"
+    KANBAN_DB_PASSWORD="${EXISTING_DB_PASSWORD:-$(openssl rand -hex 32)}"
 
     TELEGRAM_BOT_TOKEN=""
     TELEGRAM_GROUP_ID=""
@@ -964,7 +984,8 @@ do_install() {
 
     cat > "$ENV_FILE" <<EOF
 # Generated by scripts/install.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)
-DATABASE_URL=postgres://kanban:kanban@db:5432/kanban
+KANBAN_DB_PASSWORD=$KANBAN_DB_PASSWORD
+DATABASE_URL=postgres://kanban:$KANBAN_DB_PASSWORD@db:5432/kanban
 PORT=3001
 COOKIE_SECRET=$COOKIE_SECRET
 APP_URL=$APP_URL
@@ -990,16 +1011,16 @@ EOF
 
   resolve_docker
 
-  $DOCKER compose up -d db
+  compose_server up -d db
   wait_for_pg
 
   info "applying schema (idempotent)…"
-  $DOCKER compose exec -T db psql -U kanban -d kanban < server/schema.sql >/dev/null
+  compose_server exec -T db psql -U kanban -d kanban < server/schema.sql >/dev/null
   ok "schema applied"
 
   if [[ -f "$ENV_FILE" ]] && grep -q '^KNOWLEDGE_EMBEDDINGS=true' "$ENV_FILE"; then
     info "enabling pgvector extension…"
-    $DOCKER compose exec -T db psql -U kanban -d kanban -c "CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null || warn "pgvector failed to install — install manually with: docker compose exec -T db psql -U kanban -d kanban -c 'CREATE EXTENSION IF NOT EXISTS vector;'"
+    compose_server exec -T db psql -U kanban -d kanban -c "CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null || warn "pgvector failed to install — install manually with: docker compose --project-name smartkanban --env-file server/.env -f docker-compose.server.yml exec -T db psql -U kanban -d kanban -c 'CREATE EXTENSION IF NOT EXISTS vector;'"
     ok "pgvector enabled"
   fi
 
@@ -1007,9 +1028,9 @@ EOF
 
   step "Step 6/9 — building and starting the server"
 
-  $DOCKER compose up -d --build server
+  compose_server up -d --build server
   wait_for_health
-  ok "server healthy: $(curl -s http://localhost:3001/health)"
+  ok "server healthy: $(curl -s http://localhost:7301/health)"
 
   # ---------- step 7: optional Caddy ----------
 
@@ -1041,7 +1062,7 @@ EOF
 
 $HOST {
     encode zstd gzip
-    reverse_proxy localhost:3001
+    reverse_proxy localhost:7301
 }
 EOF
         need_sudo systemctl reload caddy
@@ -1089,7 +1110,7 @@ EOF
   step "Done!"
   ok "SmartKanban is running."
   echo
-  echo "  ${C_BOLD}Local URL:${C_RESET}     http://localhost:3001"
+  echo "  ${C_BOLD}Local URL:${C_RESET}     http://localhost:7301"
   [[ "$APP_URL_FROM_ENV" == https://* ]] && echo "  ${C_BOLD}Public URL:${C_RESET}    $APP_URL_FROM_ENV"
   echo "  ${C_BOLD}Install dir:${C_RESET}   $INSTALL_DIR"
   echo "  ${C_BOLD}Env file:${C_RESET}      $ENV_FILE"
@@ -1098,8 +1119,8 @@ EOF
   echo "    1. Open the URL in a browser and register the first user."
   echo "    2. Settings → Telegram identities: link your Telegram id."
   echo "    3. After everyone is registered: edit $ENV_FILE,"
-  echo "       set OPEN_SIGNUP=false, then: $DOCKER compose restart server"
-  echo "    4. Tail logs: $DOCKER compose logs -f server"
+  echo "       set OPEN_SIGNUP=false, then: docker compose --project-name smartkanban --env-file server/.env -f docker-compose.server.yml restart server"
+  echo "    4. Tail logs: docker compose --project-name smartkanban --env-file server/.env -f docker-compose.server.yml logs -f server"
   echo
   echo "  Full guide: $INSTALL_DIR/docs/DEPLOYMENT.md"
   echo "  Troubleshooting: $INSTALL_DIR/docs/DEPLOYMENT.md#troubleshooting"

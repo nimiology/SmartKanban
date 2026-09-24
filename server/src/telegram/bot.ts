@@ -631,7 +631,8 @@ function helpText(): string {
     '',
     'ساخت کار',
     '• نام کاربری‌ام را همراه با درخواست بیاور: `@bot حالت تیره را اضافه کن`',
-    '• برای ساخت کار از روی پیام متنی، عکس یا صدا، به آن پاسخ بده و بنویس: `/task [توضیح]`',
+    '• برای ثبت متن بدون پاسخ به پیام: `/task <عنوان و توضیح>`؛ بعد تاپیک صندوق ورودی یا در حال انجام را انتخاب کن.',
+    '• برای ساخت کار از روی عکس یا صدا، به پیام پاسخ بده و `/task [توضیح]` را بفرست.',
     '• «پیش‌نویس با هوش مصنوعی» یا «ثبت متن من» را انتخاب کن؛ تا وقتی دکمهٔ هوش مصنوعی را نزنی، از آن استفاده نمی‌کنم.',
     '• در گفت‌وگوی خصوصی هم می‌توانی کار بفرستی.',
     '• پس از ثبت، کارت گروهی در تاپیک انتخابی منتشر می‌شود و بات در گفت‌وگوی عمومی فقط نتیجه را اعلام می‌کند.',
@@ -1076,33 +1077,34 @@ async function handleText(
 
   if (command === 'task') {
     const allowed = allowedGroupId();
-    const source = ctx.msg?.reply_to_message;
+    const reply = ctx.msg?.reply_to_message;
     if (isPrivate || chatId === undefined || allowed === null || chatId !== allowed) {
-      await ctx.reply('دستور /task را در گروه تنظیم‌شده و در پاسخ به یک پیام بفرست.');
+      await ctx.reply('دستور /task را در گروه تنظیم‌شده بفرست؛ برای ساخت کار از متن بنویس `/task <عنوان>` یا برای عکس و صدا به همان پیام پاسخ بده.', { parse_mode: 'Markdown' });
       return;
     }
-    const sourceText = (source?.text ?? source?.caption ?? '').trim().slice(0, 2_000);
-    const sourcePhotos = source?.photo;
-    const sourcePhoto = sourcePhotos?.[sourcePhotos.length - 1];
+    const replyText = (reply?.text ?? reply?.caption ?? '').trim().slice(0, 2_000);
+    const replyPhoto = reply?.photo?.at(-1);
+    const replyAudio = reply?.voice ?? reply?.audio;
+    const source = reply && !reply.from?.is_bot && (replyText || replyPhoto || replyAudio) ? reply : undefined;
+    const sourcePhoto = source?.photo?.at(-1);
     const sourceAudio = source?.voice ?? source?.audio;
-    if (!source || source.from?.is_bot || (!sourceText && !sourcePhoto && !sourceAudio)) {
-      await ctx.reply('با دستور /task به یک پیام متنی، عکس یا صدا پاسخ بده؛ اگر خواستی توضیح کار را هم بعد از دستور بنویس.');
+    const sourceText = source ? replyText : '';
+    const instruction = rest.trim().slice(0, 1_000);
+    if (!source && !instruction) {
+      await ctx.reply('برای ساخت کار، متن را بعد از `/task` بنویس؛ برای عکس یا صدا به پیام پاسخ بده. مثال: `/task تست بات تلگرام`', { parse_mode: 'Markdown' });
       return;
     }
 
-    const instruction = rest.trim().slice(0, 1_000);
     const guessedType = /#bug\b|\bbug\b/i.test(`${instruction} ${sourceText}`) ? 'bug' : 'chore';
-    if (!(await hasTelegramWorkflowTopic('inbox', guessedType))) {
-      await ctx.reply(`ابتدا تاپیک «${guessedType === 'bug' ? ROUTE_LABEL.bugs : STATUS_LABEL.inbox}» را با دستور /topics bind ${guessedType === 'bug' ? 'bugs' : 'inbox'} وصل کن.`);
-      return;
-    }
     const mediaHint = sourcePhoto ? 'پیام انتخاب‌شده شامل تصویر است.' : sourceAudio ? 'پیام انتخاب‌شده شامل فایل صوتی است.' : '';
     const sourceDescription = sourceText || (sourcePhoto ? '[پیام تصویری]' : '[پیام صوتی]');
-    const original = [
-      instruction ? `شرح کار: ${instruction}` : 'شرح کار: از پیام انتخاب‌شده یک کار بساز.',
-      `پیام انتخاب‌شده: ${sourceDescription}`,
-    ].join('\n');
-    const threadId = source.message_thread_id ?? ctx.msg?.message_thread_id ?? 0;
+    const original = source
+      ? [
+        instruction ? `شرح کار: ${instruction}` : 'شرح کار: از پیام انتخاب‌شده یک کار بساز.',
+        `پیام انتخاب‌شده: ${sourceDescription}`,
+      ].join('\n')
+      : instruction;
+    const threadId = source?.message_thread_id ?? ctx.msg?.message_thread_id ?? 0;
     const manualText = [instruction, sourceText].filter(Boolean).join('\n\n');
     const pending = createPending({
       tgUserId: ctx.from!.id,
@@ -1116,8 +1118,7 @@ async function handleText(
       captureType: sourcePhoto ? 'photo' : sourceAudio ? 'voice' : 'text',
       manualText,
       captureMessageId: ctx.msg?.message_id,
-      taskSourceMessageId: source.message_id,
-      taskSourceThreadId: threadId,
+      ...(source ? { taskSourceMessageId: source.message_id, taskSourceThreadId: threadId } : {}),
       taskWorkType: guessedType,
       ...(sourcePhoto ? { pendingPhotoFileId: sourcePhoto.file_id, attachMode: 'new' as const } : {}),
       ...(sourceAudio ? { pendingAudioFileId: sourceAudio.file_id, attachMode: 'new' as const } : {}),

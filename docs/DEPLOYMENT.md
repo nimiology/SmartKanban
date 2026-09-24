@@ -3,6 +3,12 @@
 Step-by-step instructions for deploying SmartKanban to a production server.
 Targets a single small VPS (1 CPU / 1 GB RAM is enough for a family of 5).
 
+**Production safety:** use only `docker-compose.server.yml` with
+`--project-name smartkanban` and `server/.env`. This keeps the live database
+on `smartkanban_kanban_server_pgdata`. The root `docker-compose.yml` is for
+local development and uses a separate database. Never use bare `docker compose`
+on the production server or `docker compose down -v`.
+
 This guide assumes:
 
 - A Linux VPS you control (Debian 12 / Ubuntu 22.04+ tested)
@@ -22,7 +28,7 @@ If you just want it running, run this on a fresh Debian/Ubuntu VPS as a
 sudo-capable user:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/chatwithllm/SmartKanban/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/nimiology/SmartKanban/main/scripts/install.sh | bash
 ```
 
 The script handles everything: installs Docker, clones the repo,
@@ -100,14 +106,14 @@ directory automatically; for the manual path, pick one:
 ```bash
 sudo mkdir -p /opt/smartkanban
 sudo chown "$USER:$USER" /opt/smartkanban
-git clone https://github.com/chatwithllm/SmartKanban.git /opt/smartkanban
+git clone https://github.com/nimiology/SmartKanban.git /opt/smartkanban
 cd /opt/smartkanban
 ```
 
 **Option B — into your home directory (no sudo for clone):**
 
 ```bash
-git clone https://github.com/chatwithllm/SmartKanban.git ~/smartkanban
+git clone https://github.com/nimiology/SmartKanban.git ~/smartkanban
 cd ~/smartkanban
 ```
 
@@ -127,10 +133,15 @@ Minimum required:
 
 ```
 COOKIE_SECRET=<paste a long random string — `openssl rand -hex 32`>
-DATABASE_URL=postgres://kanban:kanban@db:5432/kanban
+KANBAN_DB_PASSWORD=<paste a long random string — `openssl rand -hex 32`>
+DATABASE_URL=postgres://kanban:<same password as KANBAN_DB_PASSWORD>@db:5432/kanban
 PORT=3001
 APP_URL=https://kanban.example.com
 ```
+
+Keep the existing `KANBAN_DB_PASSWORD` when updating an established server.
+It must match the password already stored in the production database volume.
+Do not regenerate it as part of a routine deployment.
 
 If you use the Telegram bot:
 
@@ -160,13 +171,13 @@ Save and exit.
 ## Step 4 — Bring up the database
 
 ```bash
-docker compose up -d db
+docker compose --project-name smartkanban --env-file server/.env -f docker-compose.server.yml up -d db
 ```
 
 Wait ~5 seconds, then initialize the schema (idempotent — safe to re-run):
 
 ```bash
-docker compose exec -T db psql -U kanban -d kanban < server/schema.sql
+docker compose --project-name smartkanban --env-file server/.env -f docker-compose.server.yml exec -T db psql -U kanban -d kanban < server/schema.sql
 ```
 
 You should see a series of `CREATE TABLE` / `CREATE INDEX` lines and no
@@ -177,8 +188,8 @@ errors.
 ## Step 5 — Build and start the application
 
 ```bash
-docker compose up -d --build server
-docker compose logs -f server
+docker compose --project-name smartkanban --env-file server/.env -f docker-compose.server.yml up -d --build server
+docker compose --project-name smartkanban --env-file server/.env -f docker-compose.server.yml logs -f server
 ```
 
 Watch for `server listening on 3001` and no Postgres connection errors.
@@ -248,7 +259,7 @@ whole family is registered:
 
 ```bash
 sudo nano server/.env
-docker compose restart server
+docker compose --project-name smartkanban --env-file server/.env -f docker-compose.server.yml restart server
 ```
 
 ---
@@ -271,7 +282,7 @@ docker compose restart server
    and a matching `TELEGRAM_WEBHOOK_SECRET` in `server/.env`. Restart:
 
    ```bash
-   docker compose restart server
+   docker compose --project-name smartkanban --env-file server/.env -f docker-compose.server.yml restart server
    ```
 
    The server registers the webhook with Telegram on startup. (For
@@ -326,18 +337,18 @@ or sync `/var/backups/smartkanban/` to your preferred destination
 Requires the pgvector extension and an OpenAI key.
 
 ```bash
-docker compose exec -T db psql -U kanban -d kanban \
+docker compose --project-name smartkanban --env-file server/.env -f docker-compose.server.yml exec -T db psql -U kanban -d kanban \
   -c "CREATE EXTENSION IF NOT EXISTS vector;"
 echo "KNOWLEDGE_EMBEDDINGS=true" >> server/.env
 echo "OPENAI_API_KEY=sk-…"       >> server/.env
-docker compose restart server
+docker compose --project-name smartkanban --env-file server/.env -f docker-compose.server.yml restart server
 ```
 
 The embed queue picks up existing knowledge items on the next
 write/refetch and on startup. Verify:
 
 ```bash
-docker compose logs server | grep -i embed
+docker compose --project-name smartkanban --env-file server/.env -f docker-compose.server.yml logs server | grep -i embed
 ```
 
 ---
@@ -346,11 +357,15 @@ docker compose logs server | grep -i embed
 
 ```bash
 cd /opt/smartkanban
-git pull
-docker compose exec -T db psql -U kanban -d kanban < server/schema.sql
-docker compose up -d --build server
-docker compose logs -f server
+./scripts/deploy-server.sh
 ```
+
+The script checks the expected production volume exists before deployment,
+updates the GitHub checkout, applies migrations, rebuilds the production stack,
+and checks `http://127.0.0.1:7301/health`. If it cannot find the database
+volume, it stops without creating a replacement. Keep this repository's
+`AGENTS.md` and this deployment guide with the server workflow so future
+maintenance uses the same database and Compose project.
 
 The schema is idempotent — re-running on prod is safe. New columns,
 indexes, and tables are additive.
@@ -360,7 +375,7 @@ To roll back, check out the previous commit and redeploy:
 ```bash
 git log --oneline | head -10
 git checkout <previous-sha>
-docker compose up -d --build server
+docker compose --project-name smartkanban --env-file server/.env -f docker-compose.server.yml up -d --build server
 ```
 
 (Schema migrations are forward-compatible — older code can run against
@@ -373,14 +388,14 @@ a newer schema without crashing, since columns are nullable + defaulted.)
 ### Server container restart loops
 
 ```bash
-docker compose logs --tail=200 server
+docker compose --project-name smartkanban --env-file server/.env -f docker-compose.server.yml logs --tail=200 server
 ```
 
 Common causes:
 
 - `COOKIE_SECRET` missing → app refuses to start. Set it.
 - `DATABASE_URL` wrong → connection refused. Confirm `db` is up:
-  `docker compose ps db`.
+  `docker compose --project-name smartkanban --env-file server/.env -f docker-compose.server.yml ps db`.
 - Schema not initialized → run Step 4 again.
 
 ### Telegram bot silent
@@ -407,16 +422,11 @@ box; with nginx see "Alternative: Nginx" below.
 
 ### Restoring from a backup
 
-```bash
-docker compose down
-docker volume rm kanbanclaude_kanban_pgdata   # destroys current DB
-docker compose up -d db
-gunzip -c /var/backups/smartkanban/db-<ts>.sql.gz \
-  | docker compose exec -T db psql -U kanban -d kanban
-tar -xzf /var/backups/smartkanban/attachments-<ts>.tar.gz \
-  -C /opt/smartkanban/server/data/
-docker compose up -d server
-```
+Do not remove `smartkanban_kanban_server_pgdata` as part of restore. First
+preserve a fresh backup of both the current database and attachments, verify
+the backup files, then restore into an isolated recovery database/volume and
+validate its contents before switching production. A routine `down` or
+rebuild does not require removing the database volume.
 
 ---
 
@@ -492,6 +502,6 @@ plan — none of which are goals of this project.
 
 ## Getting help
 
-- Open an issue at https://github.com/chatwithllm/SmartKanban/issues
-- Check `docker compose logs --tail=200 server` for the most useful
+- Open an issue at https://github.com/nimiology/SmartKanban/issues
+- Check `docker compose --project-name smartkanban --env-file server/.env -f docker-compose.server.yml logs --tail=200 server` for the most useful
   error context

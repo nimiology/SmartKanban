@@ -291,6 +291,12 @@ card.
 
 ## Setup
 
+These Compose commands are for local development. Production must use
+`docker-compose.server.yml`, `server/.env`, and the persistent
+`smartkanban_kanban_server_pgdata` volume; follow [the deployment guide](docs/DEPLOYMENT.md)
+and use `./scripts/deploy-server.sh` for manual upgrades. Do not use bare
+`docker compose` or `docker compose down -v` on the production server.
+
 ### 1. Requirements
 
 - Docker + Docker Compose (for Postgres; the app also has a Dockerfile)
@@ -303,7 +309,7 @@ card.
 ### 2. Clone + install
 
 ```bash
-git clone git@github.com:chatwithllm/SmartKanban.git
+git clone git@github.com:nimiology/SmartKanban.git
 cd SmartKanban
 
 docker compose up -d
@@ -359,7 +365,7 @@ resolves correctly.
 **One-click installer (both server and client)**:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/chatwithllm/SmartKanban/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/nimiology/SmartKanban/main/scripts/install.sh | bash
 ```
 
 The same script handles two distinct audiences — it asks which you're
