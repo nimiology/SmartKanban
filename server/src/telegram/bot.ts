@@ -561,6 +561,7 @@ function helpText(): string {
     '',
     'Task workflow (reply to a task card)',
     '• `/start`, `/test`, `/approve`, `/fail [notes]`',
+    '• On a failed test, the task owner can tap “↩️ Back to In Progress” on the Needs Fix card.',
     '• `/topics status` shows topic bindings; admins can use `/topics bind <route>` inside a topic.',
     '• `/assign @user` and `/share @user` update a task.',
     '• Admins: `/release <version> <commit-sha> <pass|fail> [notes]`, then `/done <version> <commit-sha> <pass|fail> [notes]`.',
@@ -623,6 +624,7 @@ function postSaveKeyboard(cardId: string, currentStatus: Status): InlineKeyboard
   if (currentStatus === 'ready_for_test') {
     kb.text('✅ Approve', `wf:approve:${cardId}`).text('🛠️ Needs fix', `wf:fail:${cardId}`);
   }
+  if (currentStatus === 'needs_fix') kb.text('↩️ Back to In Progress', `wf:start:${cardId}`);
   kb.text('🗑', `arch:${cardId}`);
   kb.row().text('🤖 AI brainstorm', `brain:${cardId}`);
   return kb;
