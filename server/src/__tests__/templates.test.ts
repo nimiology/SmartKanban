@@ -167,13 +167,13 @@ test('instantiateTemplate: creates card with template fields, creator-as-assigne
     title: 'Buy eggs',
     description: 'dozen',
     tags: ['groceries'],
-    status: 'today',
+    status: 'inbox',
   });
   const card = await instantiateTemplate(userA, t.id, { source: 'manual' });
   assert.ok(card);
   assert.equal(card!.title, 'Buy eggs');
   assert.equal(card!.description, 'dozen');
-  assert.equal(card!.status, 'today');
+  assert.equal(card!.status, 'inbox');
   assert.deepEqual(card!.tags, ['groceries']);
   assert.equal(card!.created_by, userA);
   assert.deepEqual(card!.assignees, [userA]);
@@ -199,7 +199,7 @@ test('instantiateTemplate: status_override wins over template status', async () 
     name: 'col',
     visibility: 'private',
     title: 'x',
-    status: 'today',
+    status: 'inbox',
   });
   const card = await instantiateTemplate(userA, t.id, {
     source: 'manual',
