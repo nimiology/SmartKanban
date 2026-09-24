@@ -8,10 +8,10 @@ ALTER TYPE card_status ADD VALUE IF NOT EXISTS 'ready_for_release';
 ALTER TYPE card_status ADD VALUE IF NOT EXISTS 'released';
 
 UPDATE cards SET tags = array_append(tags, 'legacy-today')
-WHERE status = 'today' AND NOT ('legacy-today' = ANY(tags));
+WHERE status::text = 'today' AND NOT ('legacy-today' = ANY(tags));
 WITH legacy AS (
   SELECT id, created_by, status::text AS old_status
-  FROM cards WHERE status IN ('backlog', 'today', 'done')
+  FROM cards WHERE status::text IN ('backlog', 'today', 'done')
 ), moved AS (
   UPDATE cards c SET status = CASE WHEN legacy.old_status = 'done' THEN 'released'::card_status ELSE 'inbox'::card_status END
   FROM legacy WHERE c.id = legacy.id
@@ -24,8 +24,8 @@ SELECT legacy.created_by, legacy.id, 'workflow.migration',
 FROM legacy JOIN moved ON moved.id = legacy.id;
 ALTER TABLE cards ALTER COLUMN status SET DEFAULT 'inbox';
 
-UPDATE card_templates SET status = 'inbox' WHERE status IN ('backlog', 'today');
-UPDATE card_templates SET status = 'released' WHERE status = 'done';
+UPDATE card_templates SET status = 'inbox' WHERE status::text IN ('backlog', 'today');
+UPDATE card_templates SET status = 'released' WHERE status::text = 'done';
 ALTER TABLE card_templates ALTER COLUMN status SET DEFAULT 'inbox';
 
 ALTER TABLE cards ADD COLUMN IF NOT EXISTS owner_user_id UUID REFERENCES users(id) ON DELETE SET NULL;

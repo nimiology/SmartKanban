@@ -177,7 +177,7 @@ docker compose --project-name smartkanban --env-file server/.env -f docker-compo
 Wait ~5 seconds, then initialize the schema (idempotent — safe to re-run):
 
 ```bash
-docker compose --project-name smartkanban --env-file server/.env -f docker-compose.server.yml exec -T db psql -U kanban -d kanban < server/schema.sql
+docker compose --project-name smartkanban --env-file server/.env -f docker-compose.server.yml exec -T db psql -v ON_ERROR_STOP=1 -U kanban -d kanban < server/schema.sql
 ```
 
 You should see a series of `CREATE TABLE` / `CREATE INDEX` lines and no
@@ -337,7 +337,7 @@ or sync `/var/backups/smartkanban/` to your preferred destination
 Requires the pgvector extension and an OpenAI key.
 
 ```bash
-docker compose --project-name smartkanban --env-file server/.env -f docker-compose.server.yml exec -T db psql -U kanban -d kanban \
+docker compose --project-name smartkanban --env-file server/.env -f docker-compose.server.yml exec -T db psql -v ON_ERROR_STOP=1 -U kanban -d kanban \
   -c "CREATE EXTENSION IF NOT EXISTS vector;"
 echo "KNOWLEDGE_EMBEDDINGS=true" >> server/.env
 echo "OPENAI_API_KEY=sk-…"       >> server/.env

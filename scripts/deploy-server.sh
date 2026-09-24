@@ -41,9 +41,9 @@ done
 
 for migration in server/migrations/*.sql; do
   [[ -f "$migration" ]] || continue
-  "${COMPOSE[@]}" exec -T db psql -U kanban -d kanban < "$migration"
+  "${COMPOSE[@]}" exec -T db psql -v ON_ERROR_STOP=1 -U kanban -d kanban < "$migration"
 done
-"${COMPOSE[@]}" exec -T db psql -U kanban -d kanban < server/schema.sql
+"${COMPOSE[@]}" exec -T db psql -v ON_ERROR_STOP=1 -U kanban -d kanban < server/schema.sql
 "${COMPOSE[@]}" up -d --build db server
 
 for _ in {1..30}; do

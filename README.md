@@ -313,7 +313,7 @@ git clone git@github.com:nimiology/SmartKanban.git
 cd SmartKanban
 
 docker compose up -d
-docker compose exec -T db psql -U kanban -d kanban < server/schema.sql
+docker compose exec -T db psql -v ON_ERROR_STOP=1 -U kanban -d kanban < server/schema.sql
 
 (cd server && npm install)
 (cd web    && npm install)

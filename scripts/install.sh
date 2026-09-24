@@ -549,11 +549,11 @@ do_upgrade() {
   # Migrations first so renames/alters run before schema's CREATE IF NOT EXISTS
   if compgen -G "server/migrations/*.sql" >/dev/null 2>&1; then
     for mig in $(ls server/migrations/*.sql | sort); do
-      compose_server exec -T db psql -U kanban -d kanban < "$mig" >/dev/null
+      compose_server exec -T db psql -v ON_ERROR_STOP=1 -U kanban -d kanban < "$mig" >/dev/null
     done
     ok "migrations applied"
   fi
-  compose_server exec -T db psql -U kanban -d kanban < server/schema.sql >/dev/null
+  compose_server exec -T db psql -v ON_ERROR_STOP=1 -U kanban -d kanban < server/schema.sql >/dev/null
   ok "schema applied"
 
   step "Rebuilding + restarting server"
@@ -1015,7 +1015,7 @@ EOF
   wait_for_pg
 
   info "applying schema (idempotent)…"
-  compose_server exec -T db psql -U kanban -d kanban < server/schema.sql >/dev/null
+  compose_server exec -T db psql -v ON_ERROR_STOP=1 -U kanban -d kanban < server/schema.sql >/dev/null
   ok "schema applied"
 
   if [[ -f "$ENV_FILE" ]] && grep -q '^KNOWLEDGE_EMBEDDINGS=true' "$ENV_FILE"; then
