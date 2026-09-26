@@ -1,7 +1,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { pool } from '../db.js';
-import { searchCardsFts } from '../cards.js';
+import { canUserSeeCard, listCards, searchCardsFts } from '../cards.js';
 
 let userA: string;
 let userB: string;
@@ -39,9 +39,17 @@ test('searchCardsFts returns user A own card when searching matching term', asyn
   assert.ok(hits.some((h) => h.id === cardOfA), 'user A should see their own card');
 });
 
-test('searchCardsFts hides user A private card from user B', async () => {
+test('searchCardsFts makes every active team card visible to user B', async () => {
   const hits = await searchCardsFts(userB, 'eggs', 10);
-  assert.ok(!hits.some((h) => h.id === cardOfA), 'user B must not see user A private card');
+  assert.ok(hits.some((h) => h.id === cardOfA), 'user B should see the team card');
+});
+
+test('all scope exposes team cards while personal remains a view filter', async () => {
+  const all = await listCards(userB, 'all');
+  const personal = await listCards(userB, 'personal');
+  assert.ok(all.some((card) => card.id === cardOfA));
+  assert.ok(!personal.some((card) => card.id === cardOfA));
+  assert.equal(await canUserSeeCard(userB, cardOfA), true);
 });
 
 test('searchCardsFts returns unassigned Family Inbox card to other users', async () => {

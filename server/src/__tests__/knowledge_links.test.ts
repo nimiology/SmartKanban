@@ -62,11 +62,12 @@ test('listKnowledgeForCard filters by knowledge visibility', async () => {
   assert.ok(ids.has(inbx.id), 'b must see inbox knowledge');
 });
 
-test('linkCard rejects when caller cannot see card', async () => {
+test('linkCard allows linking team-visible cards while retaining knowledge visibility', async () => {
   const a = await makeUser('lk_d');
   const b = await makeUser('lk_e');
-  const cardId = await makeCard(a, a); // card belongs to a only
+  const cardId = await makeCard(a, a); // personal board filter still belongs to a
   const k = await createKnowledge(b, { title: 'm', url: 'https://z.example.com', visibility: 'inbox' });
-  // b can see knowledge (inbox) but cannot see a's private card.
-  await assert.rejects(() => linkCard(b, k.id, cardId), /forbidden/);
+  await linkCard(b, k.id, cardId);
+  const linked = await listKnowledgeForCard(b, cardId);
+  assert.ok(linked.some((item) => item.id === k.id));
 });

@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import type { Proposal as AIProposal } from '../ai/propose.js';
 import type { CardLinkLabel } from '../card_links.js';
 
-export type Destination = 'private_card' | 'public_card' | 'knowledge';
+export type Destination = 'public_card' | 'knowledge';
 export type AttachState = 'new' | 'pickRecent' | 'pickFiltered';
 
 export type DupCandidate = {

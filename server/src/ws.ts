@@ -31,15 +31,9 @@ export type BroadcastEvent =
 type Client = { socket: WebSocket; userId: string; isAdmin: boolean };
 const clients = new Set<Client>();
 
-// A card is visible to `userId` if they created it, are assigned, it's shared
-// with them, or it's unassigned (Family Inbox). Matches server's SQL predicate.
-function cardVisibleTo(card: Card, userId: string): boolean {
-  return (
-    card.created_by === userId ||
-    card.assignees.includes(userId) ||
-    card.shares.includes(userId) ||
-    card.assignees.length === 0
-  );
+// Task cards are visible to every authenticated team member.
+function cardVisibleTo(_card: Card, _userId: string): boolean {
+  return true;
 }
 
 // A template is visible to `userId` if they own it or it's shared with the family.
@@ -89,13 +83,7 @@ export function broadcast(ev: BroadcastEvent) {
         continue;
       }
     }
-    if (ev.type === 'card.link.created' || ev.type === 'card.link.deleted') {
-      // Send only to owners of either endpoint card. Full visibility predicate
-      // was enforced at the route layer; this is a defense-in-depth filter for WS.
-      if (ev.from_owner_id !== c.userId && ev.to_owner_id !== c.userId) {
-        continue;
-      }
-    }
+    // Card links are team-visible with their endpoint tasks.
     if (ev.type === 'pending_changed') {
       if (!c.isAdmin) continue;
     }

@@ -77,23 +77,13 @@ export async function loadCard(id: string): Promise<Card | null> {
   return rows[0] ?? null;
 }
 
-// Cards visible to a given user: created by them, assigned to them, shared with them, OR in Family Inbox (unassigned).
-// `scope` controls which board view the user is requesting.
+// All authenticated team members can see every card. `scope` remains a view filter.
 export type Scope = 'personal' | 'inbox' | 'all' | 'shared';
 
-// Shared visibility predicate: a card is visible to a user if they created it,
-// are assigned, it's shared with them, or it's in the unassigned Family Inbox.
-const VISIBLE_TO_USER = `(
-  c.created_by = $1
-  OR EXISTS (SELECT 1 FROM card_assignees WHERE card_id = c.id AND user_id = $1)
-  OR EXISTS (SELECT 1 FROM card_shares    WHERE card_id = c.id AND user_id = $1)
-  OR NOT EXISTS (SELECT 1 FROM card_assignees WHERE card_id = c.id)
-)`;
-
-export async function canUserSeeCard(userId: string, cardId: string): Promise<boolean> {
+export async function canUserSeeCard(_userId: string, cardId: string): Promise<boolean> {
   const { rows } = await pool.query<{ ok: boolean }>(
-    `SELECT ${VISIBLE_TO_USER} AS ok FROM cards c WHERE c.id = $2`,
-    [userId, cardId],
+    `SELECT EXISTS (SELECT 1 FROM cards WHERE id = $1) AS ok`,
+    [cardId],
   );
   return !!rows[0]?.ok;
 }
@@ -113,10 +103,10 @@ export async function listCards(
              OR EXISTS (SELECT 1 FROM card_shares    WHERE card_id = c.id AND user_id = $1)
            )`
         : scope === 'shared'
-          ? `NOT c.archived AND EXISTS (SELECT 1 FROM card_shares WHERE card_id = c.id AND user_id = $1) AND c.created_by != $1`
-          : `NOT c.archived AND ${VISIBLE_TO_USER}`;
+        ? `NOT c.archived AND EXISTS (SELECT 1 FROM card_shares WHERE card_id = c.id AND user_id = $1) AND c.created_by != $1`
+          : `NOT c.archived`;
 
-  const params: unknown[] = scope === 'inbox' ? [] : [userId];
+  const params: unknown[] = scope === 'inbox' || scope === 'all' ? [] : [userId];
   let where = baseWhere;
   if (project) {
     params.push(project);
@@ -164,7 +154,7 @@ export type CardEvent = {
   actor_name: string | null;
 };
 
-export async function listArchivedCards(userId: string): Promise<Card[]> {
+export async function listArchivedCards(_userId: string): Promise<Card[]> {
   const { rows } = await pool.query<Card>(
     `
     SELECT
@@ -179,15 +169,9 @@ export async function listArchivedCards(userId: string): Promise<Card[]> {
         FROM card_attachments a WHERE a.card_id = c.id
       ), '[]'::json) AS attachments
     FROM cards c
-    WHERE c.archived AND (
-      c.created_by = $1
-      OR EXISTS (SELECT 1 FROM card_assignees WHERE card_id = c.id AND user_id = $1)
-      OR EXISTS (SELECT 1 FROM card_shares    WHERE card_id = c.id AND user_id = $1)
-      OR NOT EXISTS (SELECT 1 FROM card_assignees WHERE card_id = c.id)
-    )
+    WHERE c.archived
     ORDER BY c.updated_at DESC
     `,
-    [userId],
   );
   return rows;
 }
@@ -310,12 +294,6 @@ export async function getUnreadCounts(userId: string): Promise<Record<string, nu
          WHERE card_id = ce.card_id AND user_id = $1::uuid),
         0
       )
-      AND (
-        EXISTS (SELECT 1 FROM card_assignees WHERE card_id = ce.card_id AND user_id = $1::uuid)
-        OR EXISTS (SELECT 1 FROM card_shares    WHERE card_id = ce.card_id AND user_id = $1::uuid)
-        OR EXISTS (SELECT 1 FROM cards WHERE id = ce.card_id AND created_by = $1::uuid)
-        OR NOT EXISTS (SELECT 1 FROM card_assignees WHERE card_id = ce.card_id)
-      )
     GROUP BY ce.card_id
     `,
     [userId],
@@ -334,36 +312,22 @@ export type CardFtsHit = {
   rank: number;
 };
 
-// Visibility predicate: card visible to user iff
-//   - user is creator, OR
-//   - user is an assignee, OR
-//   - user is a sharer, OR
-//   - card is unassigned (Family Inbox — visible to everyone)
-// Matches existing visibility semantics in listCards().
 export async function searchCardsFts(
-  userId: string,
+  _userId: string,
   query: string,
   limit = 10,
 ): Promise<CardFtsHit[]> {
   const q = query.trim();
   if (!q) return [];
   const { rows } = await pool.query<CardFtsHit>(
-    `SELECT DISTINCT c.id, c.title, c.description, c.status, c.updated_at,
-            ts_rank(c.fts, websearch_to_tsquery('english', $2)) AS rank
+    `SELECT c.id, c.title, c.description, c.status, c.updated_at,
+            ts_rank(c.fts, websearch_to_tsquery('english', $1)) AS rank
      FROM cards c
-     LEFT JOIN card_assignees ca ON ca.card_id = c.id
-     LEFT JOIN card_shares cs ON cs.card_id = c.id
      WHERE NOT c.archived
-       AND c.fts @@ websearch_to_tsquery('english', $2)
-       AND (
-         c.created_by = $1
-         OR ca.user_id = $1
-         OR cs.user_id = $1
-         OR NOT EXISTS (SELECT 1 FROM card_assignees ca2 WHERE ca2.card_id = c.id)
-       )
+       AND c.fts @@ websearch_to_tsquery('english', $1)
      ORDER BY rank DESC, c.updated_at DESC
-     LIMIT $3`,
-    [userId, q, limit],
+     LIMIT $2`,
+    [q, limit],
   );
   return rows;
 }

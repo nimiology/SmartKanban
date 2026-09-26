@@ -18,7 +18,7 @@ import { broadcast } from '../ws.js';
 import { listKnowledgeForCard } from '../knowledge.js';
 import { fanOutNotification } from '../notifications.js';
 import { transitionCard, WorkflowError } from '../workflow.js';
-import { hasTelegramWorkflowTopic, publishTelegramTaskProjection } from '../telegram/bot.js';
+import { scheduleTelegramTaskProjection } from '../telegram/bot.js';
 
 const ATTACHMENTS_DIR = path.resolve(process.env.ATTACHMENTS_DIR ?? 'data/attachments');
 
@@ -36,7 +36,7 @@ export async function cardRoutes(app: FastifyInstance) {
     '/api/cards',
     { preHandler: requireUserOrMirror },
     async (req) => {
-      const scope: Scope = req.query.scope ?? 'personal';
+      const scope: Scope = req.query.scope ?? 'all';
       const project = req.query.project?.trim() || undefined;
       return listCards(req.user!.id, scope, project);
     },
@@ -139,6 +139,7 @@ export async function cardRoutes(app: FastifyInstance) {
     await logActivity(userId, cardId, 'create', { title: title.trim() });
     const card = (await loadCard(cardId))!;
     broadcast({ type: 'card.created', card });
+    scheduleTelegramTaskProjection(cardId);
     return reply.code(201).send(card);
   });
 
@@ -257,9 +258,6 @@ export async function cardRoutes(app: FastifyInstance) {
 
     let updated: Card;
     if (body.status !== undefined && body.status !== existing.status) {
-      if (!(await hasTelegramWorkflowTopic(body.status, existing.work_type))) {
-        return reply.code(409).send({ error: 'bind the target Telegram workflow topic before moving tasks there' });
-      }
       try {
         updated = await transitionCard(id, req.user!.id, body.status, body.position);
       } catch (error) {
@@ -270,7 +268,6 @@ export async function cardRoutes(app: FastifyInstance) {
       updated = (await loadCard(id))!;
     }
     await logActivity(req.user!.id, id, 'update', { changed: Object.keys(body) });
-    await publishTelegramTaskProjection(id);
 
     if (newShareRecipients.length > 0) {
       const actor = req.user!;
@@ -292,6 +289,7 @@ export async function cardRoutes(app: FastifyInstance) {
     }
 
     broadcast({ type: 'card.updated', card: updated });
+    scheduleTelegramTaskProjection(id);
     return updated;
   });
 

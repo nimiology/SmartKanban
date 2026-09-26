@@ -79,13 +79,14 @@ test('GET /api/cards/:id/events 401 without auth', async () => {
   assert.equal(res.statusCode, 401);
 });
 
-test('GET /api/cards/:id/events 404 for invisible card', async () => {
+test('GET /api/cards/:id/events exposes team card to authenticated teammate', async () => {
   const cardId = await createCard(cookieB);
   const res = await app.inject({
     method: 'GET', url: `/api/cards/${cardId}/events`,
     headers: { cookie: cookieA },
   });
-  assert.equal(res.statusCode, 404);
+  assert.equal(res.statusCode, 200);
+  assert.ok(Array.isArray(res.json()));
 });
 
 // ---- POST /api/cards/:id/messages ----
@@ -124,14 +125,15 @@ test('POST /api/cards/:id/messages 400 for content over 2000 chars', async () =>
   assert.equal(res.statusCode, 400);
 });
 
-test('POST /api/cards/:id/messages 404 for invisible card', async () => {
+test('POST /api/cards/:id/messages allows authenticated teammate on team card', async () => {
   const cardId = await createCard(cookieB);
   const res = await app.inject({
     method: 'POST', url: `/api/cards/${cardId}/messages`,
     headers: { cookie: cookieA },
     payload: { content: 'hi' },
   });
-  assert.equal(res.statusCode, 404);
+  assert.equal(res.statusCode, 201);
+  assert.equal((res.json() as { content: string }).content, 'hi');
 });
 
 test('GET /api/cards/:id/events shows message after post', async () => {

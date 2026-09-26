@@ -59,14 +59,10 @@ export async function authRoutes(app: FastifyInstance) {
         );
         const userId = rows[0]!.id;
 
-        // First registered user inherits any pre-existing (Phase 1) cards with no
-        // created_by and receives an env_promote audit row (spec §3 + §11 step 1).
+        // Adopt pre-login cards without inventing an owner. All authenticated
+        // team members can see cards; ownership remains an explicit workflow field.
         if (userCount === 0) {
           await client.query(`UPDATE cards SET created_by = $1 WHERE created_by IS NULL`, [userId]);
-          await client.query(
-            `INSERT INTO card_assignees (card_id, user_id) SELECT id, $1 FROM cards WHERE NOT archived ON CONFLICT DO NOTHING`,
-            [userId],
-          );
           await writeAudit(client, {
             actor_id: userId,
             action: 'env_promote',

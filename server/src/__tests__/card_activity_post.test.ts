@@ -97,7 +97,7 @@ test('POST /api/cards/:id/activity 400 when body missing', async () => {
   assert.equal(r.statusCode, 400);
 });
 
-test('POST /api/cards/:id/activity 404 when card invisible', async () => {
+test('POST /api/cards/:id/activity allows token owner to update a team card', async () => {
   const at = await app.inject({
     method: 'POST', url: '/api/tokens', headers: { cookie: cookieA },
     payload: { label: 'test-token-3' },
@@ -114,5 +114,5 @@ test('POST /api/cards/:id/activity 404 when card invisible', async () => {
     headers: { authorization: `Bearer ${apiTokenA}` },
     payload: { type: 'note', body: 'x' },
   });
-  assert.equal(r.statusCode, 404);
+  assert.equal(r.statusCode, 201);
 });

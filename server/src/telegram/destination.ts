@@ -7,13 +7,11 @@ const URL_RE = /https?:\/\//i;
  * Picks the auto-selected destination for the new structured-capture flow.
  *
  *   - Knowledge: title or description contains a URL
- *   - Private card: DM with no URL
- *   - Public card: group with no URL (lands in Family Inbox)
+ *   - Shared team task: any chat with no URL
  *
  * The AIProposal type does not carry an explicit `links` array, so URL
  * detection happens on the title + description strings directly. The
- * original message text is checked by the caller (sendProposal) via
- * the existing `extractUrls` helper.
+ * original message text is checked by the caller via `extractUrls`.
  */
 export function defaultDestination(
   p: Pick<AIProposal, 'title' | 'description'>,
@@ -25,21 +23,16 @@ export function defaultDestination(
     URL_RE.test(p.description ?? '') ||
     URL_RE.test(extraText);
   if (hasLink) return 'knowledge';
-  return isPrivateChat ? 'private_card' : 'public_card';
+  void isPrivateChat;
+  return 'public_card';
 }
 
 export function destinationOptions(
   isPrivateChat: boolean,
 ): Array<{ key: Destination; label: string }> {
-  return isPrivateChat
-    ? [
-        { key: 'private_card', label: '🔒 شخصی' },
-        { key: 'public_card', label: '👥 گروه' },
-        { key: 'knowledge', label: '📚 دانش' },
-      ]
-    : [
-        { key: 'public_card', label: '👥 صندوق ورودی گروه' },
-        { key: 'private_card', label: '🔒 کارهای من' },
-        { key: 'knowledge', label: '📚 دانش' },
-      ];
+  void isPrivateChat;
+  return [
+    { key: 'public_card', label: '👥 جریان مشترک تسک‌ها' },
+    { key: 'knowledge', label: '📚 دانش' },
+  ];
 }

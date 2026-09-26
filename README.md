@@ -48,12 +48,12 @@ destination chooser:
 📝 Buy eggs
 Tags: #groceries
 
-[✓ 🔒 Private] [👥 Public] [📚 Knowledge]
+[✓ 👥 Shared task stream] [📚 Knowledge]
 [🔍 Check duplicates?]
 [✏️ Edit] [❌ Cancel]
 ```
 
-- **🔒 Private / 👥 Public** — saves a new task to Inbox
+- **👥 Shared task stream** — saves a new task to Inbox for the whole SmartKanban team
 - **📚 Knowledge** — saves directly (URL auto-fetch if present, otherwise
   saved as a note)
 - **🔍 Check duplicates?** — runs Postgres FTS + OpenAI re-rank
@@ -79,11 +79,11 @@ After vision / Whisper extracts text, the bot asks:
 visible to you, with a `[Pick]` row per item and a "reply with text to
 filter" hint. A reply re-renders the picker filtered by FTS. Picking a
 card attaches the photo / audio to it; picking a knowledge item falls
-back to a new private card (knowledge attachments are web-only for now).
+back to a new shared task (knowledge attachments are web-only for now).
 
 ### After save
 
-The proposal message transforms into quick-action buttons:
+The bot publishes an editable task card with quick-action buttons:
 
 ```
 ✓ Saved · 📥 Inbox — Buy eggs
@@ -96,29 +96,27 @@ move through Inbox → In Progress → Ready for Test → Ready for Release →
 Released / Done, with Needs Fix returning to In Progress. The assigned tester
 must differ from the owner and records the pass/fail result.
 
-### Telegram project topics
+### Telegram task stream
 
-In the configured Telegram forum group, bind one topic per route by running the
-command from inside that topic as a workflow admin:
+The configured regular group chat is the shared task stream. Each active task
+is mirrored as one editable group card and, after a member starts the bot, one
+editable DM card for each linked Telegram identity. Cards show the full
+description and task fields; long text continues in linked messages. Projection
+failures stay in a durable retry queue. The bot start link is in
+**Settings → Telegram identities**.
 
-```
-/topics bind inbox
-/topics bind in-progress
-/topics bind ready-for-test
-/topics bind needs-fix
-/topics bind ready-for-release
-/topics bind released
-/topics bind bugs
-/topics status
-```
+During cutover, the bot republishes each active task to the regular group and
+linked DMs. Existing forum-topic posts remain as history. A group admin should
+disable forum topics after deploying the cutover. The bot does not read ordinary
+group conversation; it processes replies to task cards, slash commands, direct
+mentions, and explicit replies to pending capture prompts.
 
-Reply to a teammate's message with `/task [instruction]` to capture it. The bot
-searches only explicitly remembered messages from that same topic, once, with
-bounded results; it does not crawl group history. New tasks are posted to Inbox,
-or Bugs / Triage when marked `#bug`. On each valid status change, the bot posts
-the current task card in the mapped topic and marks its previous post as moved.
-Failed projections stay in a durable retry queue and are retried automatically.
-Reply to a task card with `/start`, `/test`, `/approve`, or `/fail [notes]`.
+Reply to a task card with `/start`, `/test`, `/approve`, or `/fail [notes]`, or
+use a clear Persian instruction such as «ببرش در حال انجام» or «بده به سارا».
+To create a separate task from another member's message, reply to it and mention
+the bot, then confirm the preview. To split a task, reply to its card with the
+requested parts and confirm the child-card preview. Each child is an independent
+task linked with `split_from`.
 
 Release admins record the staging result with
 `/release <version> <commit-sha> <pass|fail> [notes]`, then the exact same
@@ -221,20 +219,19 @@ Links are visible in:
 - Telegram capture flow: tap **🔗 Link to existing** on the destination
   keyboard → pick card → pick label → optional note
 
-### Privacy model
+### Visibility model
 
-- DM to bot → private to you (assignees = [you]; nobody else sees it,
-  ever — verified by per-client WebSocket broadcast filtering)
-- Group post → goes to Family Inbox by default; tap **Private** to
-  move it onto your personal board only
-- Single-card endpoints reject access to cards you can't see
-  (creator / assignee / share / inbox)
+- Every task is visible to every signed-in SmartKanban team member on the board.
+- Tasks captured by DM or group both join the shared task stream. Telegram
+  mirrors show each task in the configured group and linked member DMs.
+- Workflow transitions still enforce task-owner, tester, and release-admin
+  permissions.
 - Templates: private template events filtered server-side; only
   the owner receives `template.*` WS events for their private items
 - Knowledge: same filter — private items never broadcast outside owner
 - Telegram `/remember` saves only a message that a linked member explicitly
-  replies to; saved context is scoped to that chat/topic, expires after 30 days,
-  and `/task` searches only remembered messages from the source topic
+  replies to; saved context is scoped to that chat and reply thread, expires
+  after 30 days, and `/task` searches only explicitly remembered messages
 - Passwords hashed with Argon2id; sessions are `httpOnly sameSite=lax`
   cookies
 
@@ -274,13 +271,13 @@ Links are visible in:
 - **Storage:** local filesystem at `server/data/attachments/<card_id>/…`
 
 **No `boards` table** — a board is a filter over cards (`scope=personal`,
-`scope=inbox`, `scope=all`). Position is `DOUBLE PRECISION` so drag-drop
+`scope=inbox`, `scope=all`). The default `all` view contains every active team
+card. Position is `DOUBLE PRECISION` so drag-drop
 never needs bulk renumbering — just pick a midpoint.
 
-**Per-client WebSocket broadcast filtering**: when a card / template /
-knowledge item is created/updated, the server only sends it to sockets
-whose user has visibility into that resource. Private items never reach
-other people's browsers in any form.
+**Per-client WebSocket filtering**: task cards are sent to every authenticated
+team member. Private templates and knowledge items remain filtered by owner
+and explicit sharing.
 
 **Server-clock skew correction**: the client reads the `Date:` header on
 API responses and uses the server's view of "now" for relative time
@@ -394,12 +391,11 @@ for your domain + Telegram + AI keys), schema init, build, optional
 Caddy auto-HTTPS, backups, and a printable onboarding snippet for the
 notetaker-kanban bridge.
 
-For existing installations, back up the database, apply
-`server/migrations/2026-09-23-telegram-context-messages.sql` and then
-`server/migrations/2026-09-23-workflow-v2.sql`, then restart the server.
-Configure `TELEGRAM_GROUP_ID`, create the seven forum topics, link member
-identities, and mark workflow admins in `users.is_admin` before using the
-Telegram workflow.
+For existing installations, back up the database, apply the pending SQL files
+in `server/migrations` in filename order, then restart the server. Configure
+`TELEGRAM_GROUP_ID`, link member identities, and mark workflow admins in
+`users.is_admin`. After deploying the flat-chat cutover, a group admin should
+disable forum topics in Telegram; old topic messages remain as history.
 
 Client side detects OS (macOS/Linux), checks deps (`git`, `curl`, `jq`),
 clones the bridge to `$HOME/.notetaker-kanban`, runs the bridge's own
@@ -415,17 +411,17 @@ a fresh Debian/Ubuntu host to a working install behind Caddy or nginx.
 
 ### 5. First user & Telegram linking
 
-1. Register the first account in the app (becomes the owner; any
-   pre-existing Phase-1 cards get auto-assigned to them).
-2. DM [@userinfobot](https://t.me/userinfobot) → get your Telegram user id.
-3. In the app: **Settings → Telegram identities** → paste your id, click
-   **Link to me**.
-4. Add the bot to your family Telegram group. Disable privacy mode via
-   BotFather (`/mybots` → Bot Settings → Group Privacy → Turn off).
-5. Send any message in the group — a card appears within a second.
-6. DM the bot directly for private captures.
+1. Register the first account in the app.
+2. In **Settings → Telegram identities**, open the SmartKanban bot link and
+   send `/start` once.
+3. DM [@userinfobot](https://t.me/userinfobot) to get your Telegram user ID,
+   then link that ID in Settings.
+4. Add the bot to the configured group and keep Telegram privacy mode enabled.
+   It responds to task replies, slash commands, direct mentions, and explicit
+   capture replies; ordinary group conversation stays ignored.
+5. Repeat steps 2–3 for each team member who should receive DM mirrors.
 
-Repeat step 2–3 for each additional family member.
+Repeat steps 2–3 for each additional team member.
 
 ### 6. (Optional) Enable semantic knowledge search
 
@@ -525,8 +521,8 @@ safe to re-run on an existing database).
 
 | Method | Path                                 | Notes                                |
 | ------ | ------------------------------------ | ------------------------------------ |
-| GET    | `/api/cards?scope=personal\|inbox\|all` | Visibility enforced               |
-| GET    | `/api/cards/archived`                | Visible archived cards               |
+| GET    | `/api/cards?scope=personal\|inbox\|all` | Authenticated team cards; scope filters the view |
+| GET    | `/api/cards/archived`                | Team archived cards                  |
 | POST   | `/api/cards`                         |                                      |
 | GET    | `/api/cards/:id`                     |                                      |
 | PATCH  | `/api/cards/:id`                     | Partial: title, status, tags, …      |
@@ -573,9 +569,10 @@ safe to re-run on an existing database).
 | GET    | `/api/review`                     | Done / stale / stuck + AI summary        |
 | POST   | `/api/telegram/link`              | Link TG user id → app user               |
 | GET    | `/api/telegram/identities`        | List                                     |
+| GET    | `/api/telegram/config`            | Public bot start link                    |
 | DELETE | `/api/telegram/identities/:id`    | Unlink                                   |
 | POST   | `/telegram/webhook/<secret>`      | Telegram webhook endpoint                |
-| WS     | `/ws`                             | Per-client filtered broadcasts           |
+| WS     | `/ws`                             | Team-wide task cards; private knowledge/templates filtered |
 | GET    | `/attachments/*`                  | Auth-gated file serve                    |
 | GET    | `/health`                         | `{ ok: true }`                           |
 
@@ -662,14 +659,12 @@ Per-client visibility filter applies to all `template.*` and
 
 | Command          | Where      | Behavior                                                    |
 | ---------------- | ---------- | ----------------------------------------------------------- |
-| (any text)       | DM / group | Run AI proposal flow                                        |
-| (voice/audio)    | DM / group | Whisper transcribe → card + audio attached                  |
-| (photo)          | DM / group | Vision summarize → card + image attached                    |
-| `/today <msg>`   | DM / group | Legacy shortcut; save directly to Inbox                     |
-| `/task [prompt]` | group reply | Create from replied-to text, photo, or audio + bounded remembered context |
-| `/topics status` | group      | Show workflow topic bindings                                |
-| `/topics bind …` | topic      | Bind current forum topic to a workflow route (admin)        |
-| `/start`         | task reply | Inbox → In Progress (owner)                                 |
+| (any text)       | DM / group mention | Run task capture flow                              |
+| (voice/audio)    | DM / group reply/mention | Whisper → shared task + attachment           |
+| (photo)          | DM / group reply/mention | Vision → shared task + attachment             |
+| `/today <msg>`   | DM / group | Save directly to the shared Inbox                           |
+| `/task [prompt]` | group reply | Create from replied-to text, photo, or audio + explicitly remembered context |
+| `/start`         | task reply | Inbox → In Progress (owner); in DM, queue active task mirrors |
 | `/test`          | task reply | In Progress → Ready for Test (owner)                        |
 | `/approve`       | task reply | Pass peer test (assigned tester)                            |
 | `/fail [notes]`  | task reply | Fail peer test (assigned tester)                            |
@@ -685,9 +680,10 @@ Per-client visibility filter applies to all `template.*` and
 | `/note`          | DM         | Create knowledge item (title on first line, body after)     |
 | `/k <query>`     | DM         | Search knowledge items                                      |
 | `/klist`         | DM         | List your knowledge items                                   |
-| `/remember [note]` | reply in group | Save the replied-to text as same-topic task context for 30 days |
+| `/remember [note]` | reply in group | Save the replied-to text as bounded task context for 30 days |
 | `/forget`          | reply in group | Remove remembered context (original author or saver only)      |
-| `/task <prompt>`   | reply in group | Propose a task using the replied-to message and remembered context in that topic |
+| Persian task instruction | task-card reply | Move or assign; unclear targets get one question |
+| Separate / split task | message or task reply | Preview first; create only after confirmation |
 
 `/use`, `/t`, `/templates` in group chats are silently ignored to
 prevent the command body from being parsed as a card seed.
@@ -798,9 +794,9 @@ event flow exercises most paths.
 - **Not** mobile-native — responsive web + PWA install is the support
   model
 - Telegram discussions stay in Telegram; SmartKanban manages task state and
-  projects current task cards into configured forum topics
+  mirrors current task cards into the configured group and linked member DMs
 
-Plus these explicit v1 omissions: color priorities, subtasks/checklists,
+Plus these explicit v1 omissions: color priorities, checklist-style subtasks,
 card comments, multi-group Telegram, per-user custom column layouts,
 push notifications.
 

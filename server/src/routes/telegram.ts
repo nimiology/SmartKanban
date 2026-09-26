@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { pool } from '../db.js';
 import { requireUser } from '../auth.js';
-import { telegramWebhookCallback } from '../telegram/bot.js';
+import { queueActiveTaskMirrors, telegramBotStartUrl, telegramWebhookCallback } from '../telegram/bot.js';
 
 export async function telegramRoutes(app: FastifyInstance) {
   // Webhook endpoint (secret in path to deter scanning)
@@ -29,6 +29,7 @@ export async function telegramRoutes(app: FastifyInstance) {
                telegram_username = EXCLUDED.telegram_username`,
         [telegram_user_id, req.user!.id, telegram_username ?? null],
       );
+      await queueActiveTaskMirrors();
       return { ok: true };
     },
   );
@@ -40,10 +41,18 @@ export async function telegramRoutes(app: FastifyInstance) {
     return rows;
   });
 
+  app.get('/api/telegram/config', { preHandler: requireUser }, async () => ({
+    bot_start_url: telegramBotStartUrl(),
+  }));
+
   app.delete<{ Params: { id: string } }>(
     '/api/telegram/identities/:id',
     { preHandler: requireUser },
     async (req, reply) => {
+      await pool.query(
+        `UPDATE telegram_task_messages SET is_current = FALSE
+         WHERE recipient_telegram_user_id = $1`, [Number(req.params.id)],
+      );
       await pool.query(`DELETE FROM telegram_identities WHERE telegram_user_id = $1`, [
         Number(req.params.id),
       ]);

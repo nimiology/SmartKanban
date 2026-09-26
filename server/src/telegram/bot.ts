@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { createHash, randomBytes } from 'node:crypto';
 import { Bot, InlineKeyboard, webhookCallback, type Context } from 'grammy';
 import { pool } from '../db.js';
 import { broadcast } from '../ws.js';
@@ -8,6 +9,8 @@ import { transcribeAudio } from '../ai/whisper.js';
 import { summarizeImage } from '../ai/vision.js';
 import { AI_ENABLED } from '../ai/openai.js';
 import { proposeFromText, type Proposal as AIProposal } from '../ai/propose.js';
+import { formatTaskProjection, splitTelegramText } from './task_projection.js';
+import { interpretTaskInstruction } from './task_instruction.js';
 import {
   createPending,
   deletePending,
@@ -62,9 +65,26 @@ const pendingTagTargets = new Map<number, {
   createdAt: number;
 }>();
 const TAG_TARGET_TTL_MS = 15 * 60 * 1000;
+type DraftTask = { title: string; description: string };
+type PendingTaskAction = {
+  telegramUserId: number;
+  appUserId: string;
+  chatId: number;
+  parentCardId: string | null;
+  action: 'separate' | 'split';
+  tasks: DraftTask[];
+  createdAt: number;
+};
+const pendingTaskActions = new Map<string, PendingTaskAction>();
+const TASK_ACTION_TTL_MS = 15 * 60 * 1000;
 
 export function getBot(): Bot | null {
   return botInstance;
+}
+
+export function telegramBotStartUrl(): string | null {
+  const username = botInstance?.botInfo?.username ?? process.env.TELEGRAM_BOT_USERNAME;
+  return username ? `https://t.me/${username.replace(/^@/, '')}?start=smartkanban` : null;
 }
 
 const ATTACHMENTS_DIR = path.resolve(process.env.ATTACHMENTS_DIR ?? 'data/attachments');
@@ -85,11 +105,6 @@ const STATUS_LABEL: Record<Status, string> = {
   needs_fix: 'نیازمند اصلاح',
   ready_for_release: 'آمادهٔ انتشار',
   released: 'منتشرشده / پایان‌یافته',
-};
-
-const ROUTE_LABEL: Record<string, string> = {
-  ...STATUS_LABEL,
-  bugs: 'اشکال‌ها / بررسی اولیه',
 };
 
 const WORK_TYPE_LABEL: Record<string, string> = {
@@ -136,17 +151,6 @@ function knowledgeErrorText(error: unknown): string {
     case 'owner': return 'اجازهٔ تغییر این مورد را نداری.';
     default: return 'اطلاعات واردشده معتبر نیست.';
   }
-}
-
-export async function hasTelegramWorkflowTopic(status: Status, workType: string): Promise<boolean> {
-  const groupId = allowedGroupId();
-  if (!groupId) return true;
-  const route = status === 'inbox' && workType === 'bug' ? 'bugs' : status;
-  const { rows } = await pool.query(
-    `SELECT 1 FROM telegram_workflow_topics WHERE group_chat_id = $1 AND route_key = $2`,
-    [groupId, route],
-  );
-  return rows.length > 0;
 }
 
 async function resolveAppUser(telegramUserId: number, username?: string): Promise<string | null> {
@@ -293,43 +297,46 @@ async function createCard(opts: CreateOpts): Promise<string> {
   return cardId;
 }
 
-const WORKFLOW_ROUTES: Record<string, Status | 'bugs'> = {
-  inbox: 'inbox',
-  'in-progress': 'in_progress',
-  'ready-for-test': 'ready_for_test',
-  'needs-fix': 'needs_fix',
-  'ready-for-release': 'ready_for_release',
-  released: 'released',
-  bugs: 'bugs',
+type ProjectionRow = {
+  id: string;
+  message_id: string;
+  part_index: number;
+  projected_hash: string | null;
+  projected_status: Status | null;
+  projected_owner_user_id: string | null;
+  projected_tester_user_id: string | null;
+  notified_status: Status | null;
 };
 
-async function projectCardToTopic(cardId: string): Promise<boolean> {
-  await pool.query(
+async function projectCardToMirrors(cardId: string): Promise<boolean> {
+  const { rows } = await pool.query<{ projection_version: string }>(
     `INSERT INTO telegram_projection_outbox (card_id) VALUES ($1)
-     ON CONFLICT (card_id) DO UPDATE SET next_attempt_at = NOW(), updated_at = NOW()`,
+     ON CONFLICT (card_id) DO UPDATE SET next_attempt_at = NOW(), updated_at = NOW()
+     RETURNING updated_at::text AS projection_version`,
     [cardId],
   );
+  const projectionVersion = rows[0]!.projection_version;
   if (projectingCards.has(cardId)) return false;
   projectingCards.add(cardId);
   try {
-    const delivered = await projectCardToTopicUnsafe(cardId);
+    const delivered = await projectCardToMirrorsUnsafe(cardId, projectionVersion);
     if (!delivered) {
       await pool.query(
         `UPDATE telegram_projection_outbox SET attempts = attempts + 1,
            next_attempt_at = NOW() + LEAST(3600, 30 * POWER(2, LEAST(attempts, 7))) * INTERVAL '1 second',
            last_error = 'projection unavailable or not delivered', updated_at = NOW()
-         WHERE card_id = $1`, [cardId],
+         WHERE card_id = $1 AND updated_at = $2::timestamptz`, [cardId, projectionVersion],
       );
     }
     return delivered;
   } catch (error) {
-    console.error('[telegram] task topic projection failed:', error);
+    console.error('[telegram] task mirror projection failed:', error);
     await pool.query(
-      `UPDATE telegram_projection_outbox SET attempts = attempts + 1,
+       `UPDATE telegram_projection_outbox SET attempts = attempts + 1,
          next_attempt_at = NOW() + LEAST(3600, 30 * POWER(2, LEAST(attempts, 7))) * INTERVAL '1 second',
          last_error = $2, updated_at = NOW()
-       WHERE card_id = $1`,
-      [cardId, String(error).slice(0, 500)],
+       WHERE card_id = $1 AND updated_at = $3::timestamptz`,
+      [cardId, String(error).slice(0, 500), projectionVersion],
     ).catch(() => {});
     return false;
   } finally {
@@ -337,103 +344,263 @@ async function projectCardToTopic(cardId: string): Promise<boolean> {
   }
 }
 
-export async function publishTelegramTaskProjection(cardId: string): Promise<void> {
-  await projectCardToTopic(cardId);
+export async function publishTelegramTaskProjection(cardId: string): Promise<boolean> {
+  return projectCardToMirrors(cardId);
 }
 
-async function projectCardToTopicUnsafe(cardId: string): Promise<boolean> {
-  const groupId = allowedGroupId();
-  if (!groupId || !botInstance) return false;
+export function scheduleTelegramTaskProjection(cardId: string): void {
+  void publishTelegramTaskProjection(cardId).catch((error) => {
+    console.error('[telegram] could not queue task projection:', error);
+  });
+}
+
+async function projectCardToMirrorsUnsafe(cardId: string, projectionVersion: string): Promise<boolean> {
   const card = await loadCard(cardId);
   if (!card) return false;
-  const routeKey = card.status === 'inbox' && card.work_type === 'bug' ? 'bugs' : card.status;
-  const { rows: topicRows } = await pool.query<{ thread_id: string }>(
-    `SELECT thread_id FROM telegram_workflow_topics WHERE group_chat_id = $1 AND route_key = $2`,
-    [groupId, routeKey],
+  if (card.archived) {
+    const { rows } = await pool.query<{ id: string; chat_id: string; message_id: string }>(
+      `SELECT id::text, chat_id::text, message_id::text FROM telegram_task_messages
+       WHERE card_id = $1 AND is_current`, [cardId],
+    );
+    if (botInstance) {
+      for (const row of rows) {
+        await botInstance.api.editMessageText(Number(row.chat_id), Number(row.message_id), '🗑 این تسک بایگانی شد.', {
+          reply_markup: undefined,
+        }).catch(() => {});
+      }
+    }
+    await pool.query(`UPDATE telegram_task_messages SET is_current = FALSE WHERE card_id = $1`, [cardId]);
+    await pool.query(
+      `DELETE FROM telegram_projection_outbox WHERE card_id = $1 AND updated_at = $2::timestamptz`,
+      [cardId, projectionVersion],
+    );
+    return true;
+  }
+  const groupId = allowedGroupId();
+  if (!groupId || !botInstance) return false;
+  const ownerAndTester = await pool.query<{
+    owner_name: string | null; tester_name: string | null; parent_title: string | null;
+  }>(
+    `SELECT COALESCE(NULLIF(owner.short_name, ''), owner.name) AS owner_name,
+            COALESCE(NULLIF(tester.short_name, ''), tester.name) AS tester_name,
+            parent.title AS parent_title
+     FROM cards c
+     LEFT JOIN users owner ON owner.id = c.owner_user_id
+     LEFT JOIN users tester ON tester.id = c.tester_user_id
+     LEFT JOIN card_links link ON link.from_card_id = c.id AND link.label = 'split_from'
+     LEFT JOIN cards parent ON parent.id = link.to_card_id
+     WHERE c.id = $1 LIMIT 1`, [cardId],
   );
-  const threadId = topicRows[0]?.thread_id;
-  if (!threadId) return false;
+  const appUrl = process.env.PUBLIC_APP_URL?.trim() || process.env.APP_URL?.trim() || 'http://localhost:3001';
+  const boardUrl = `${appUrl.replace(/\/$/, '')}/m/card/${card.id}`;
+  const text = formatTaskProjection({
+    ...card,
+    owner_name: ownerAndTester.rows[0]?.owner_name ?? null,
+    tester_name: ownerAndTester.rows[0]?.tester_name ?? null,
+    parent_title: ownerAndTester.rows[0]?.parent_title ?? null,
+    board_url: boardUrl,
+    status_label: STATUS_LABEL[card.status],
+    type_label: WORK_TYPE_LABEL[card.work_type] ?? card.work_type,
+  });
+  const parts = splitTelegramText(text);
+  const tasks = [{
+    chatId: groupId,
+    telegramUserId: null as number | null,
+    appUserId: null as string | null,
+    isAdmin: false,
+  }, ...(await pool.query<{
+    telegram_user_id: string; app_user_id: string; is_admin: boolean;
+  }>(
+    `SELECT ti.telegram_user_id::text, ti.app_user_id::text, u.is_admin
+     FROM telegram_identities ti JOIN users u ON u.id = ti.app_user_id
+     ORDER BY ti.created_at, ti.telegram_user_id`,
+  )).rows.map((row) => ({
+    chatId: Number(row.telegram_user_id),
+    telegramUserId: Number(row.telegram_user_id),
+    appUserId: row.app_user_id,
+    isAdmin: row.is_admin,
+  }))];
 
-  const owner = card.owner_user_id ? await pool.query<{ name: string }>(
-    `SELECT name FROM users WHERE id = $1`, [card.owner_user_id],
-  ) : { rows: [] as Array<{ name: string }> };
-  const tester = card.tester_user_id ? await pool.query<{ name: string }>(
-    `SELECT name FROM users WHERE id = $1`, [card.tester_user_id],
-  ) : { rows: [] as Array<{ name: string }> };
-  const lines = [
-    `${STATUS_EMOJI[card.status]} ${card.title}`,
-    `${WORK_TYPE_LABEL[card.work_type] ?? card.work_type} · اولویت ${card.priority} · ${STATUS_LABEL[card.status]}`,
-    `مسئول: ${owner.rows[0]?.name ?? 'تعیین‌نشده'} · آزمایش‌گر: ${tester.rows[0]?.name ?? 'تعیین‌نشده'}`,
-    `شناسهٔ کار: ${card.id}`,
-  ];
-  if (card.tags.length) lines.push(`برچسب‌ها: ${card.tags.map((tag) => `#${tag}`).join(' ')}`);
-  if (card.acceptance_criteria.length) lines.push(`معیارهای پذیرش: ${card.acceptance_criteria.join(' · ')}`);
-  if (card.branch_url) lines.push(`شاخه: ${card.branch_url}`);
-  if (card.pull_request_url) lines.push(`درخواست ادغام: ${card.pull_request_url}`);
-  if (card.peer_test_notes) lines.push(`یادداشت‌های آزمایش: ${card.peer_test_notes}`);
-  const nextUserIds = card.status === 'ready_for_test'
-    ? (card.tester_user_id ? [card.tester_user_id] : [])
-    : card.status === 'needs_fix'
-      ? (card.owner_user_id ? [card.owner_user_id] : [])
-      : card.status === 'ready_for_release' || card.status === 'released'
-        ? (await pool.query<{ id: string }>(`SELECT id FROM users WHERE is_admin`)).rows.map((row) => row.id)
-        : [];
-  if (nextUserIds.length) {
-    const { rows } = await pool.query<{ telegram_username: string | null; name: string | null }>(
-      `SELECT DISTINCT ON (u.id) ti.telegram_username, u.short_name AS name
-       FROM users u LEFT JOIN telegram_identities ti ON ti.app_user_id = u.id
-       WHERE u.id = ANY($1::uuid[]) ORDER BY u.id, ti.created_at ASC`,
-      [nextUserIds],
-    );
-    const mentions = rows.map((row) => row.telegram_username ? `@${row.telegram_username}` : row.name ?? 'هم‌تیمی');
-    if (mentions.length) lines.push(`مرحلهٔ بعد: ${mentions.join('، ')}`);
-  }
-  const prior = await pool.query<{ message_id: string; thread_id: string }>(
-    `SELECT message_id, thread_id FROM telegram_task_messages
-     WHERE card_id = $1 AND is_current LIMIT 1`, [cardId],
-  );
-  const moved = prior.rows[0]
-    ? `\n↪ به تاپیک «${ROUTE_LABEL[routeKey] ?? routeKey}» منتقل شد؛ کارت فعلی در ادامه آمده است.`
-    : '';
-  if (prior.rows[0]) {
+  let allDelivered = true;
+  for (const recipient of tasks) {
     try {
-      await botInstance.api.editMessageText(
-        groupId,
-        Number(prior.rows[0].message_id),
-        `📌 ${card.title}\n${moved}`,
+      const oldParts = await pool.query<ProjectionRow>(
+        `SELECT id::text, message_id::text, part_index, projected_hash, projected_status,
+                projected_owner_user_id::text, projected_tester_user_id::text, notified_status
+         FROM telegram_task_messages
+         WHERE card_id = $1 AND recipient_telegram_user_id IS NOT DISTINCT FROM $2::bigint
+           AND is_current ORDER BY part_index`,
+        [cardId, recipient.telegramUserId],
       );
-    } catch { /* old projection may have been deleted or become uneditable */ }
+      const oldByPart = new Map(oldParts.rows.map((row) => [row.part_index, row]));
+      const projectedMessageIds = new Map<number, number>();
+      const keyboards = new InlineKeyboard()
+        .url('🌐 SmartKanban', boardUrl)
+        .row();
+      if (card.status !== 'released') {
+        keyboards.row();
+        if (card.status === 'inbox') keyboards.text('▶️ شروع کار', `wf:start:${card.id}`);
+        if (card.status === 'in_progress') keyboards.text('🧪 ارسال برای آزمایش', `wf:test:${card.id}`);
+        if (card.status === 'ready_for_test') keyboards.text('✅ تأیید', `wf:approve:${card.id}`).text('🛠 اصلاح', `wf:fail:${card.id}`);
+        if (card.status === 'needs_fix') keyboards.text('↩️ ادامهٔ کار', `wf:start:${card.id}`);
+      }
+
+      for (let partIndex = 0; partIndex < parts.length; partIndex++) {
+        const prior = oldByPart.get(partIndex);
+        const projectedHash = createHash('sha256').update(`${card.status}\n${parts[partIndex]}`).digest('hex');
+        let messageId: number;
+        let sentNew = false;
+        const continuationReply = partIndex > 0 && projectedMessageIds.has(0)
+          ? { reply_parameters: { message_id: projectedMessageIds.get(0)!, allow_sending_without_reply: true } }
+          : {};
+        try {
+          if (!prior) throw Object.assign(new Error('projection missing'), { fallbackToSend: true });
+          if (prior.projected_hash !== projectedHash) {
+            await botInstance.api.editMessageText(
+              recipient.chatId,
+              Number(prior.message_id),
+              parts[partIndex]!,
+              {
+                link_preview_options: { is_disabled: true },
+                reply_markup: partIndex === 0 ? keyboards : undefined,
+              },
+            );
+          }
+          messageId = Number(prior.message_id);
+        } catch (error) {
+          const errorCode = typeof error === 'object' && error !== null && 'error_code' in error
+            ? Number((error as { error_code?: unknown }).error_code) : 0;
+          const description = error instanceof Error ? error.message.toLowerCase() : '';
+          if (prior && errorCode !== 400 && !description.includes('message is not modified')) throw error;
+          if (prior && description.includes('message is not modified')) {
+            messageId = Number(prior.message_id);
+          } else {
+            const sent = await botInstance.api.sendMessage(recipient.chatId, parts[partIndex]!, {
+              link_preview_options: { is_disabled: true },
+              reply_markup: partIndex === 0 ? keyboards : undefined,
+              ...continuationReply,
+            });
+            messageId = sent.message_id;
+            sentNew = true;
+          }
+        }
+        const client = await pool.connect();
+        try {
+          if (prior && !sentNew) {
+            const needsAction = partIndex === 0 && recipient.telegramUserId !== null &&
+              recipientNeedsAction(card, recipient.appUserId, recipient.isAdmin);
+            const recipientChanged = prior.projected_owner_user_id !== card.owner_user_id ||
+              prior.projected_tester_user_id !== card.tester_user_id;
+            await client.query(
+              `UPDATE telegram_task_messages SET projected_status = $2, projected_hash = $5,
+                 projected_owner_user_id = $6, projected_tester_user_id = $7,
+                 notified_status = CASE WHEN $3::boolean AND $4::boolean THEN NULL
+                   WHEN $3::boolean THEN notified_status ELSE $2 END
+               WHERE id = $1`,
+              [prior.id, card.status, needsAction, recipientChanged, projectedHash,
+                card.owner_user_id, card.tester_user_id],
+            );
+          } else {
+            await client.query(
+              `UPDATE telegram_task_messages SET is_current = FALSE
+               WHERE card_id = $1 AND recipient_telegram_user_id IS NOT DISTINCT FROM $2::bigint
+                 AND part_index = $3 AND is_current`,
+              [cardId, recipient.telegramUserId, partIndex],
+            );
+            await client.query(
+              `INSERT INTO telegram_task_messages
+                (card_id, chat_id, thread_id, recipient_telegram_user_id, part_index,
+                 projected_status, projected_hash, projected_owner_user_id, projected_tester_user_id,
+                 notified_status, message_id, is_current)
+               VALUES ($1, $2, 0, $3, $4, $5, $6, $7, $8, $9, $10, TRUE)`,
+              [cardId, recipient.chatId, recipient.telegramUserId, partIndex, card.status,
+                projectedHash, card.owner_user_id, card.tester_user_id,
+                recipient.telegramUserId !== null && recipientNeedsAction(card, recipient.appUserId, recipient.isAdmin) ? null : card.status,
+                messageId],
+            );
+          }
+        } finally {
+          client.release();
+        }
+        projectedMessageIds.set(partIndex, messageId);
+        if (partIndex === 0 && recipient.telegramUserId !== null &&
+            recipientNeedsAction(card, recipient.appUserId, recipient.isAdmin)) {
+          const latest = await pool.query<{ notified_status: Status | null }>(
+            `SELECT notified_status FROM telegram_task_messages WHERE card_id = $1
+               AND recipient_telegram_user_id = $2 AND part_index = 0 AND is_current LIMIT 1`,
+            [cardId, recipient.telegramUserId],
+          );
+          if (latest.rows[0]?.notified_status !== card.status) {
+            const actionText = card.status === 'ready_for_test'
+              ? `🧪 نوبت آزمایش توست: ${card.title}`
+              : card.status === 'needs_fix'
+                ? `🛠 این کار به اصلاح برگشته و مسئولش تویی: ${card.title}`
+                : card.status === 'ready_for_release'
+                  ? `🚀 کار برای انتشار آماده است: ${card.title}`
+                  : `✅ کار برای اقدام آماده است: ${card.title}`;
+            await botInstance.api.sendMessage(recipient.chatId, actionText, {
+              reply_markup: new InlineKeyboard().url('باز کردن کار', boardUrl),
+            });
+            await pool.query(
+              `UPDATE telegram_task_messages SET notified_status = $3
+               WHERE card_id = $1 AND recipient_telegram_user_id = $2 AND part_index = 0 AND is_current`,
+              [cardId, recipient.telegramUserId, card.status],
+            );
+          }
+        }
+      }
+
+      for (const [partIndex, prior] of oldByPart) {
+        if (partIndex < parts.length) continue;
+        await botInstance.api.editMessageText(recipient.chatId, Number(prior.message_id),
+          'جزئیات این کار کوتاه شده است؛ متن کامل را در کارت اصلی ببین.').catch(() => {});
+        await pool.query(`UPDATE telegram_task_messages SET is_current = FALSE WHERE id = $1`, [prior.id]);
+      }
+    } catch (error) {
+      allDelivered = false;
+      console.error('[telegram] task mirror delivery failed:', recipient.telegramUserId ?? 'group', error);
+    }
   }
-  let sent;
-  try {
-    sent = await botInstance.api.sendMessage(groupId, lines.join('\n'), {
-      message_thread_id: Number(threadId),
-      link_preview_options: { is_disabled: true },
-      reply_markup: postSaveKeyboard(card.id, card.status),
-    });
-  } catch (error) {
-    console.error('[telegram] task topic projection failed:', error);
-    return false;
-  }
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    await client.query(`UPDATE telegram_task_messages SET is_current = FALSE WHERE card_id = $1 AND is_current`, [cardId]);
-    await client.query(
-      `INSERT INTO telegram_task_messages (card_id, chat_id, thread_id, message_id, is_current)
-       VALUES ($1, $2, $3, $4, TRUE)`,
-      [cardId, groupId, threadId, sent.message_id],
+  if (allDelivered) {
+    await pool.query(
+      `DELETE FROM telegram_projection_outbox WHERE card_id = $1 AND updated_at = $2::timestamptz`,
+      [cardId, projectionVersion],
     );
-    await client.query(`DELETE FROM telegram_projection_outbox WHERE card_id = $1`, [cardId]);
-    await client.query('COMMIT');
-  } catch (error) {
-    await client.query('ROLLBACK').catch(() => {});
-    console.error('[telegram] task projection index update failed:', error);
-    return false;
-  } finally {
-    client.release();
   }
-  return true;
+  return allDelivered;
+}
+
+function recipientNeedsAction(
+  card: { status: Status; owner_user_id: string | null; tester_user_id: string | null },
+  appUserId: string | null,
+  isAdmin: boolean,
+): boolean {
+  return (card.status === 'ready_for_test' && Boolean(appUserId && card.tester_user_id === appUserId)) ||
+    (card.status === 'needs_fix' && Boolean(appUserId && card.owner_user_id === appUserId)) ||
+    (card.status === 'ready_for_release' && isAdmin);
+}
+
+export async function queueActiveTaskMirrors(): Promise<void> {
+  await pool.query(
+    `INSERT INTO telegram_projection_outbox (card_id)
+     SELECT id FROM cards WHERE NOT archived
+     ON CONFLICT (card_id) DO UPDATE SET next_attempt_at = NOW(), updated_at = NOW()`,
+  );
+  await flushProjectionOutbox();
+}
+
+async function queueMissingGroupMirrors(): Promise<void> {
+  const groupId = allowedGroupId();
+  if (!groupId) return;
+  await pool.query(
+    `INSERT INTO telegram_projection_outbox (card_id)
+     SELECT c.id FROM cards c
+     WHERE NOT c.archived AND NOT EXISTS (
+       SELECT 1 FROM telegram_task_messages tm
+       WHERE tm.card_id = c.id AND tm.chat_id = $1 AND tm.recipient_telegram_user_id IS NULL AND tm.is_current
+     )
+     ON CONFLICT (card_id) DO NOTHING`, [groupId],
+  );
 }
 
 async function flushProjectionOutbox(): Promise<void> {
@@ -441,7 +608,7 @@ async function flushProjectionOutbox(): Promise<void> {
     `SELECT card_id FROM telegram_projection_outbox WHERE next_attempt_at <= NOW()
      ORDER BY updated_at LIMIT 25`,
   );
-  for (const row of rows) await projectCardToTopic(row.card_id);
+  for (const row of rows) await projectCardToMirrors(row.card_id);
 }
 
 async function cardForReply(
@@ -457,6 +624,105 @@ async function cardForReply(
     [chatId, replyToMessageId],
   );
   return rows[0]?.id ?? null;
+}
+
+async function resolveLinkedMember(query: string): Promise<Array<{ id: string; name: string }>> {
+  const term = query.trim().replace(/^@/, '').toLocaleLowerCase();
+  if (!term) return [];
+  const { rows } = await pool.query<{ id: string; name: string }>(
+    `SELECT DISTINCT u.id::text AS id, COALESCE(NULLIF(u.short_name, ''), u.name) AS name
+     FROM users u LEFT JOIN telegram_identities ti ON ti.app_user_id = u.id
+     WHERE ti.telegram_user_id IS NOT NULL
+       AND (LOWER(u.name) = $1 OR LOWER(COALESCE(u.short_name, '')) = $1
+        OR LOWER(COALESCE(ti.telegram_username, '')) = $1)`,
+    [term],
+  );
+  return rows;
+}
+
+async function setTaskOwner(cardId: string, actorId: string, ownerId: string): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query<{ tester_user_id: string | null }>(
+      `SELECT tester_user_id::text FROM cards WHERE id = $1 AND NOT archived FOR UPDATE`,
+      [cardId],
+    );
+    const card = rows[0];
+    if (!card) throw new WorkflowError('Task not found or unavailable.', 'not_found');
+    if (card.tester_user_id === ownerId) {
+      throw new WorkflowError('Owner and tester must be different.', 'invalid_assignment');
+    }
+    await client.query(`UPDATE cards SET owner_user_id = $2, updated_at = NOW() WHERE id = $1`, [cardId, ownerId]);
+    await client.query(`DELETE FROM card_assignees WHERE card_id = $1`, [cardId]);
+    await client.query(`INSERT INTO card_assignees (card_id, user_id) VALUES ($1, $2)`, [cardId, ownerId]);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+  await logActivity(actorId, cardId, 'telegram.assign', { owner_user_id: ownerId });
+}
+
+function createTaskActionDraft(pending: Omit<PendingTaskAction, 'createdAt'>): string {
+  for (const [id, item] of pendingTaskActions) {
+    if (Date.now() - item.createdAt > TASK_ACTION_TTL_MS) pendingTaskActions.delete(id);
+  }
+  const id = randomBytes(8).toString('base64url');
+  pendingTaskActions.set(id, { ...pending, createdAt: Date.now() });
+  return id;
+}
+
+async function showTaskActionPreview(
+  ctx: Context,
+  input: Omit<PendingTaskAction, 'createdAt'>,
+): Promise<void> {
+  const id = createTaskActionDraft(input);
+  const isSplit = input.action === 'split';
+  const body = input.tasks.map((task, index) =>
+    `${index + 1}. ${task.title}${task.description ? `\n${task.description}` : ''}`,
+  ).join('\n\n');
+  const keyboard = new InlineKeyboard()
+    .text(`✅ ساخت ${input.tasks.length} ${isSplit ? 'زیرتسک' : 'کار'}`, `taskdraft:confirm:${id}`)
+    .text('❌ لغو', `taskdraft:cancel:${id}`);
+  const preview = `${isSplit ? 'پیش‌نمایش زیرتسک‌ها' : 'پیش‌نمایش کار جداگانه'}:\n\n${body}\n\nفقط پس از تأیید ساخته می‌شوند.`;
+  const parts = splitTelegramText(preview);
+  for (let index = 0; index < parts.length; index++) {
+    await ctx.reply(parts[index]!, index === parts.length - 1 ? { reply_markup: keyboard } : {});
+  }
+}
+
+async function createDraftTasks(pending: PendingTaskAction): Promise<string[]> {
+  const created: string[] = [];
+  for (const task of pending.tasks) {
+    const id = await createCard({
+      title: task.title,
+      description: task.description,
+      createdBy: pending.appUserId,
+      source: 'telegram',
+      status: 'inbox',
+    });
+    if (pending.parentCardId) {
+      const link = await createLink(pending.appUserId, id, pending.parentCardId, 'split_from', null);
+      const parent = await loadCard(pending.parentCardId);
+      broadcast({
+        type: 'card.link.created',
+        link,
+        from_owner_id: pending.appUserId,
+        to_owner_id: parent?.created_by ?? '',
+      });
+    }
+    await logActivity(pending.appUserId, id,
+      pending.parentCardId ? 'telegram.task.split_from' : 'telegram.task.separate',
+      pending.parentCardId ? { parent_card_id: pending.parentCardId } : {});
+    const card = await loadCard(id);
+    if (card) broadcast({ type: 'card.created', card });
+    await projectCardToMirrors(id);
+    created.push(id);
+  }
+  return created;
 }
 
 // Map @usernames mentioned in the command body to app user IDs via telegram_identities.
@@ -519,10 +785,10 @@ async function reactOk(ctx: Context, emoji: ReactionEmoji = '👍'): Promise<voi
   } catch {}
 }
 
-async function sendToChatTopic(chatId: number | undefined, threadId: number | undefined, text: string): Promise<void> {
+async function sendToChat(chatId: number | undefined, text: string): Promise<void> {
   if (chatId === undefined) return;
   if (!botInstance) return;
-  await botInstance.api.sendMessage(chatId, text, threadId === undefined ? {} : { message_thread_id: threadId });
+  await botInstance.api.sendMessage(chatId, text);
 }
 
 export function extractUrls(text: string): string[] {
@@ -616,7 +882,6 @@ async function sendCaptureChoice(
   const message = pending.taskSourceMessageId !== undefined && !pending.isPrivateChat
     ? await ctx.api.sendMessage(pending.chatId, text, {
       reply_markup: replyMarkup,
-      ...(pending.taskSourceThreadId ? { message_thread_id: pending.taskSourceThreadId } : {}),
       ...(pending.captureMessageId !== undefined
         ? { reply_parameters: { message_id: pending.captureMessageId, allow_sending_without_reply: true } }
         : {}),
@@ -627,25 +892,25 @@ async function sendCaptureChoice(
 
 function helpText(): string {
   return [
-    'گفت‌وگوی عادی گروه را نادیده می‌گیرم. برای کار با من، نام کاربری‌ام را صدا بزن، دستور بفرست یا به یکی از پیام‌های فعال من پاسخ بده.',
+    'گفت‌وگوی عادی گروه را نادیده می‌گیرم. برای کار با من، نام کاربری‌ام را صدا بزن، دستور بفرست یا به کارت تسک من پاسخ بده.',
     '',
     'ساخت کار',
     '• نام کاربری‌ام را همراه با درخواست بیاور: `@bot حالت تیره را اضافه کن`',
-    '• برای ثبت متن بدون پاسخ به پیام: `/task <عنوان و توضیح>`؛ بعد تاپیک صندوق ورودی یا در حال انجام را انتخاب کن.',
-    '• برای ساخت کار از روی عکس یا صدا، به پیام پاسخ بده و `/task [توضیح]` را بفرست.',
+    '• برای ثبت متن بدون پاسخ به پیام: `/task <عنوان و توضیح>`؛ سپس Inbox یا In Progress را انتخاب کن.',
+    '• برای ساخت کار از روی عکس یا صدا، به پیام پاسخ بده و بات را با نام کاربری‌اش صدا بزن؛ می‌توانی `/task [توضیح]` را هم بنویسی.',
     '• «پیش‌نویس با هوش مصنوعی» یا «ثبت متن من» را انتخاب کن؛ تا وقتی دکمهٔ هوش مصنوعی را نزنی، از آن استفاده نمی‌کنم.',
-    '• در گفت‌وگوی خصوصی هم می‌توانی کار بفرستی.',
-    '• پس از ثبت، کارت گروهی در تاپیک انتخابی منتشر می‌شود و بات در گفت‌وگوی عمومی فقط نتیجه را اعلام می‌کند.',
+    '• کارهایی که در گفت‌وگوی خصوصی بات می‌فرستی هم در گروه و تختهٔ SmartKanban دیده می‌شوند.',
+    '• هر تسک یک کارت گروهی و برای هر عضو پیوندخورده یک کارت در گفت‌وگوی خصوصی بات دارد؛ برای دریافت آینهٔ خصوصی، یک‌بار `/start` را برای بات بفرست.',
     '• دستور `/today <کار>` متن را بدون هوش مصنوعی مستقیم در صندوق ورودی ثبت می‌کند.',
     '',
-    'حافظهٔ محدود به تاپیک',
-    '• برای ذخیرهٔ متن یک پیام در همین تاپیک، به آن پاسخ بده و `/remember [یادداشت]` یا `/forget` را بفرست.',
+    'حافظهٔ محدود به پیام',
+    '• برای ذخیرهٔ متن یک پیام، به آن پاسخ بده و `/remember [یادداشت]` یا `/forget` را بفرست.',
     '',
     'گردش کار (در پاسخ به کارت کار)',
     '• `/start`، `/test`، `/approve`، `/fail [یادداشت]`',
     '• پس از رد شدن در آزمایش، مسئول کار می‌تواند از کارت «نیازمند اصلاح» گزینهٔ «↩️ بازگشت به در حال انجام» را بزند.',
-    '• دستور `/topics status` اتصال تاپیک‌ها را نشان می‌دهد؛ مدیران می‌توانند داخل هر تاپیک `/topics bind <مسیر>` را اجرا کنند.',
-    '• دستورهای `/assign @user` و `/share @user` مسئولان و دسترسی کار را تغییر می‌دهند.',
+    '• `/assign @user` مسئول کار را عوض می‌کند و `/share @user` کار را در فیلتر «اشتراک‌گذاری‌شده با من» نشان می‌دهد؛ همهٔ اعضای تیم به همهٔ کارها دسترسی دارند.',
+    '• در پاسخ به کارت، بگو «ببرش در حال انجام»، «بده به Nima» یا «این بخش را جدا کن». برای شکستن کار، پیش‌نمایش زیرتسک‌ها را تأیید کن.',
     '• برای افزودن برچسب به کارت، دکمهٔ «🏷 برچسب» را بزن و `/tag فوری، رابط کاربری` را بفرست؛ نیازی به پاسخ‌دادن به پیام نیست. همچنین می‌توانی `/tag <شناسه‌کار> برچسب۱، برچسب۲` را بفرستی.',
     '• مدیران: `/release <نسخه> <شناسه-commit> <pass|fail> [یادداشت]` و سپس `/done <نسخه> <شناسه-commit> <pass|fail> [یادداشت]`.',
     '',
@@ -735,7 +1000,7 @@ async function sendProposal(
   try {
     const messageText = isPrivateChat
       ? proposalText(p, links)
-      : 'پیش‌نویس آماده است. مقصد و تاپیک را انتخاب کن؛ کارت گروهی فقط در تاپیک انتخابی منتشر می‌شود.';
+      : 'پیش‌نویس آماده است. جریان مشترک تسک‌ها یا دانش را انتخاب کن.';
     const msg = await ctx.reply(messageText, {
       parse_mode: 'Markdown',
       reply_markup: destinationKeyboard(
@@ -829,6 +1094,97 @@ async function handleText(
   const replyToId = ctx.msg?.reply_to_message?.message_id;
   const chatId = ctx.chat?.id;
   const referencedCardId = await cardForReply(chatId, replyToId);
+
+  if (command === 'start' && isPrivate && !referencedCardId) {
+    await queueActiveTaskMirrors();
+    await ctx.reply('🤖 کارت‌های فعال برای همگام‌سازی در گفت‌وگوی خصوصی صف شدند. هر تسک جدید هم اینجا به‌روز می‌شود.');
+    return;
+  }
+
+  const repliedMessage = ctx.msg?.reply_to_message;
+  if (!command && repliedMessage) {
+    const task = referencedCardId ? await loadCard(referencedCardId) : null;
+    const instruction = await interpretTaskInstruction({
+      instruction: text,
+      repliedMessage: (repliedMessage.text ?? repliedMessage.caption ?? '').slice(0, 4_000),
+      ...(task ? { task: { title: task.title, description: task.description, status: task.status } } : {}),
+    });
+    if (instruction?.action === 'unclear') {
+      await ctx.reply(instruction.question);
+      return;
+    }
+    if (instruction?.action === 'move') {
+      if (!referencedCardId) {
+        await ctx.reply('برای تغییر وضعیت، به کارت همان تسک پاسخ بده.');
+        return;
+      }
+      try {
+        const updated = await transitionCard(referencedCardId, createdBy, instruction.status);
+        broadcast({ type: 'card.updated', card: updated });
+        await projectCardToMirrors(updated.id);
+        await ctx.reply(`${STATUS_EMOJI[updated.status]} «${updated.title}» به «${STATUS_LABEL[updated.status]}» منتقل شد.`);
+      } catch (error) {
+        await ctx.reply(workflowErrorText(error));
+      }
+      return;
+    }
+    if (instruction?.action === 'assign') {
+      if (!referencedCardId) {
+        await ctx.reply('برای تعیین مسئول، به کارت همان تسک پاسخ بده.');
+        return;
+      }
+      const matches = await resolveLinkedMember(instruction.person);
+      if (matches.length !== 1) {
+        await ctx.reply(matches.length
+          ? `چند هم‌تیمی با این نام پیدا شد: ${matches.map((item) => item.name).join('، ')}. نام دقیق یا نام کاربری تلگرام را بفرست.`
+          : `هم‌تیمی پیوندخورده‌ای با نام «${instruction.person}» پیدا نکردم. نام دقیق یا نام کاربری تلگرام را بفرست.`);
+        return;
+      }
+      try {
+        await setTaskOwner(referencedCardId, createdBy, matches[0]!.id);
+        const updated = (await loadCard(referencedCardId))!;
+        broadcast({ type: 'card.updated', card: updated });
+        await projectCardToMirrors(updated.id);
+        await ctx.reply(`👤 مسئول «${updated.title}» به ${matches[0]!.name} تغییر کرد.`);
+      } catch (error) {
+        await ctx.reply(error instanceof WorkflowError && error.code === 'invalid_assignment'
+          ? 'مسئول و آزمایش‌گر باید دو عضو متفاوت باشند.'
+          : workflowErrorText(error));
+      }
+      return;
+    }
+    if (instruction?.action === 'separate') {
+      await showTaskActionPreview(ctx, {
+        telegramUserId: ctx.from!.id,
+        appUserId: createdBy,
+        chatId: chatId!,
+        parentCardId: null,
+        action: 'separate',
+        tasks: [{ title: instruction.title, description: instruction.description }],
+      });
+      return;
+    }
+    if (instruction?.action === 'split') {
+      if (!referencedCardId) {
+        await ctx.reply('برای شکستن یک تسک، به کارت همان تسک پاسخ بده و بخش‌های جداگانه را مشخص کن.');
+        return;
+      }
+      await showTaskActionPreview(ctx, {
+        telegramUserId: ctx.from!.id,
+        appUserId: createdBy,
+        chatId: chatId!,
+        parentCardId: referencedCardId,
+        action: 'split',
+        tasks: instruction.tasks,
+      });
+      return;
+    }
+    if (instruction === null) {
+      await ctx.reply('نتوانستم دستور را تشخیص بدهم. برای تغییر دستی وضعیت از /start، /test، /approve یا /fail استفاده کن؛ برای ساخت کار از پیام پاسخ‌داده‌شده /task را بفرست.');
+      return;
+    }
+    if (task && instruction.action === 'none') return;
+  }
 
   if (command === 'release' || command === 'done') {
     if (isPrivate || chatId !== allowedGroupId() || !(await isWorkflowAdmin(createdBy))) {
@@ -933,7 +1289,7 @@ async function handleText(
       const card = await loadCard(id);
       if (card) {
         broadcast({ type: 'card.updated', card });
-        await projectCardToTopic(id);
+        await projectCardToMirrors(id);
       }
     }
     await ctx.reply(passed
@@ -942,80 +1298,19 @@ async function handleText(
     return;
   }
 
-  if (command === 'topics') {
-    const allowed = allowedGroupId();
-    if (isPrivate || chatId === undefined || allowed === null || chatId !== allowed) {
-      await ctx.reply('مدیریت تاپیک فقط در گروه تلگرام تنظیم‌شده در دسترس است.');
-      return;
-    }
-    if (!(await isWorkflowAdmin(createdBy))) {
-      await ctx.reply('فقط مدیر گردش کار می‌تواند تاپیک‌ها را متصل کند.');
-      return;
-    }
-    const [action, route] = rest.trim().toLowerCase().split(/\s+/, 2);
-    if (action === 'bind') {
-      const routeKey = route ? WORKFLOW_ROUTES[route] : undefined;
-      const threadId = ctx.msg?.message_thread_id;
-      if (!routeKey || !threadId) {
-        await ctx.reply('داخل تاپیک انجمن این دستور را اجرا کن: `/topics bind inbox|in-progress|ready-for-test|needs-fix|ready-for-release|released|bugs`.', { parse_mode: 'Markdown' });
-        return;
-      }
-      try {
-        await pool.query(
-          `INSERT INTO telegram_workflow_topics (group_chat_id, route_key, thread_id, bound_by)
-           VALUES ($1, $2, $3, $4)
-           ON CONFLICT (group_chat_id, route_key) DO UPDATE
-             SET thread_id = EXCLUDED.thread_id, bound_by = EXCLUDED.bound_by, updated_at = NOW()`,
-          [chatId, routeKey, threadId, createdBy],
-        );
-        await ctx.reply(`این تاپیک به «${ROUTE_LABEL[routeKey]}» متصل شد.`);
-      } catch (error) {
-        console.error('[telegram] topic bind failed:', error);
-        await ctx.reply('این تاپیک از قبل به مسیر دیگری وصل است. با `/topics status` اتصال‌ها را بررسی کن.');
-      }
-      return;
-    }
-    if (action === 'status') {
-      const { rows } = await pool.query<{ route_key: string; thread_id: string }>(
-        `SELECT route_key, thread_id FROM telegram_workflow_topics WHERE group_chat_id = $1 ORDER BY route_key`,
-        [chatId],
-      );
-      await ctx.reply(rows.length
-        ? `اتصال تاپیک‌های گردش کار:\n${rows.map((row) => `• ${ROUTE_LABEL[row.route_key] ?? row.route_key}: تاپیک ${row.thread_id}`).join('\n')}`
-        : 'هنوز تاپیکی وصل نشده است. از داخل هر تاپیک انجمن دستور `/topics bind <route>` را اجرا کن.',
-      { parse_mode: 'Markdown' });
-      return;
-    }
-    await ctx.reply('از `/topics status` استفاده کن یا داخل یک تاپیک انجمن `/topics bind <route>` را اجرا کن.', { parse_mode: 'Markdown' });
-    return;
-  }
-
   if (['start', 'test', 'approve', 'fail'].includes(command ?? '')) {
-    const allowed = allowedGroupId();
-    if (isPrivate || chatId === undefined || allowed === null || chatId !== allowed) {
-      await ctx.reply('دستورهای گردش کار فقط در گروه تلگرام تنظیم‌شده در دسترس هستند.');
-      return;
-    }
     if (!referencedCardId) {
       await ctx.reply(`در پاسخ به کارت کار، دستور /${command}${command === 'fail' ? ' <یادداشت آزمایش>' : ''} را بفرست.`);
       return;
     }
     try {
-      const targetStatus: Status = command === 'start' ? 'in_progress'
-        : command === 'test' ? 'ready_for_test'
-          : command === 'approve' ? 'ready_for_release' : 'needs_fix';
-      const task = await loadCard(referencedCardId);
-      if (task && !(await hasTelegramWorkflowTopic(targetStatus, task.work_type))) {
-        await ctx.reply(`ابتدا تاپیک «${STATUS_LABEL[targetStatus]}» را با دستور /topics bind ${targetStatus.replaceAll('_', '-')} وصل کن.`);
-        return;
-      }
       const updated = command === 'start'
         ? await transitionCard(referencedCardId, createdBy, 'in_progress')
         : command === 'test'
           ? await transitionCard(referencedCardId, createdBy, 'ready_for_test')
           : await recordPeerTest(referencedCardId, createdBy, command === 'approve', rest.trim());
       broadcast({ type: 'card.updated', card: updated });
-      await projectCardToTopic(updated.id);
+      await projectCardToMirrors(updated.id);
       await ctx.reply(`${STATUS_EMOJI[updated.status]} «${updated.title}» به «${STATUS_LABEL[updated.status]}» منتقل شد.`);
     } catch (error) {
       if (error instanceof WorkflowError) await ctx.reply(workflowErrorText(error));
@@ -1055,7 +1350,7 @@ async function handleText(
           body: sourceText,
           note: rest,
         });
-        await ctx.reply(`🧠 این پیام تا ${REMEMBERED_CONTEXT_DAYS} روز ذخیره شد و فقط در همین تاپیک برای ساخت کار استفاده می‌شود.`);
+        await ctx.reply(`🧠 این پیام تا ${REMEMBERED_CONTEXT_DAYS} روز ذخیره شد و فقط هنگام پاسخ به همین پیام قابل استفاده است.`);
       } else {
         const removed = await forgetContextMessage(
           chatId,
@@ -1126,7 +1421,7 @@ async function handleText(
     await sendCaptureChoice(
       ctx,
       pending,
-      `درخواست آماده است.${mediaHint ? ` ${mediaHint}` : ''} پیش‌نویس را با هوش مصنوعی بساز یا متن خودت را به‌عنوان کار ثبت کن. گزینهٔ هوش مصنوعی می‌تواند پیام‌هایی را هم در نظر بگیرد که با /remember در همین تاپیک ذخیره کرده‌ای.`,
+      `درخواست آماده است.${mediaHint ? ` ${mediaHint}` : ''} پیش‌نویس را با هوش مصنوعی بساز یا متن خودت را به‌عنوان کار ثبت کن. گزینهٔ هوش مصنوعی فقط پیام‌هایی را هم در نظر می‌گیرد که صریحاً با /remember ذخیره کرده‌ای.`,
       sourcePhoto ? 'توصیف تصویر' : sourceAudio ? 'پیاده‌سازی صدا' : undefined,
     );
     return;
@@ -1190,30 +1485,9 @@ async function handleText(
       await logActivity(createdBy, cardId, 'telegram.tags', { added: tags });
       const updated = (await loadCard(cardId))!;
       broadcast({ type: 'card.updated', card: updated });
-      const { rows } = await pool.query<{
-        telegram_chat_id: number | string | null;
-        projected_to_group: boolean;
-      }>(
-        `SELECT c.telegram_chat_id,
-                EXISTS (SELECT 1 FROM telegram_task_messages tm WHERE tm.card_id = c.id AND tm.chat_id = $2) AS projected_to_group
-         FROM cards c WHERE c.id = $1`,
-        [cardId, allowedGroupId()],
-      );
-      const groupId = allowedGroupId();
-      const isPublicGroupCard = groupId !== null && (
-        Number(rows[0]?.telegram_chat_id) === groupId || rows[0]?.projected_to_group === true
-      );
-      const projected = chatId === groupId && isPublicGroupCard
-        ? await projectCardToTopic(cardId)
-        : false;
+      await projectCardToMirrors(cardId);
       if (tgUserId) pendingTagTargets.delete(tgUserId);
-      const routeKey = updated.status === 'inbox' && updated.work_type === 'bug' ? 'bugs' : updated.status;
-      const destination = chatId === groupId && isPublicGroupCard
-        ? projected
-          ? `؛ کارت در تاپیک «${ROUTE_LABEL[routeKey]}» هم به‌روز شد`
-          : `؛ به‌روزرسانی کارت در تاپیک «${ROUTE_LABEL[routeKey]}» در صف ارسال است`
-        : '';
-      await ctx.reply(`🏷 برچسب‌ها به «${updated.title}» اضافه شد: ${tags.map((tag) => `#${tag}`).join(' ')}${destination}.`);
+      await ctx.reply(`🏷 برچسب‌ها به «${updated.title}» اضافه شد: ${tags.map((tag) => `#${tag}`).join(' ')}؛ کارت‌های آینه به‌روز می‌شوند.`);
       return;
     }
 
@@ -1247,15 +1521,23 @@ async function handleText(
   if (command === 'assign' && referencedCardId) {
     const userIds = await usersFromMentions(extractMentions(rest));
     if (userIds.length > 0) {
-      await pool.query(`DELETE FROM card_assignees WHERE card_id = $1`, [referencedCardId]);
-      await pool.query(
-        `INSERT INTO card_assignees (card_id, user_id) SELECT $1, UNNEST($2::uuid[]) ON CONFLICT DO NOTHING`,
-        [referencedCardId, userIds],
-      );
-      await logActivity(createdBy, referencedCardId, 'telegram.assign', { assignees: userIds });
-      const card = (await loadCard(referencedCardId))!;
-      broadcast({ type: 'card.updated', card });
-      await reactOk(ctx);
+      try {
+        await setTaskOwner(referencedCardId, createdBy, userIds[0]!);
+        if (userIds.length > 1) {
+          await pool.query(
+            `INSERT INTO card_assignees (card_id, user_id) SELECT $1, UNNEST($2::uuid[]) ON CONFLICT DO NOTHING`,
+            [referencedCardId, userIds.slice(1)],
+          );
+        }
+        const card = (await loadCard(referencedCardId))!;
+        broadcast({ type: 'card.updated', card });
+        await projectCardToMirrors(referencedCardId);
+        await reactOk(ctx);
+      } catch (error) {
+        await ctx.reply(error instanceof WorkflowError && error.code === 'invalid_assignment'
+          ? 'مسئول و آزمایش‌گر باید دو عضو متفاوت باشند.'
+          : workflowErrorText(error));
+      }
     } else {
       await reactOk(ctx, '🤔');
     }
@@ -1286,10 +1568,6 @@ async function handleText(
   if (command === 'today') {
     const { title, description } = splitTitleDesc(clean);
     if (!title) return;
-    if (!isPrivate && allowedGroupId() !== null && !(await hasTelegramWorkflowTopic('inbox', 'chore'))) {
-      await ctx.reply('ابتدا تاپیک «صندوق ورودی» را با دستور /topics bind inbox وصل کن.');
-      return;
-    }
     const cardId = await createCard({
       title,
       description,
@@ -1299,22 +1577,17 @@ async function handleText(
       status: 'inbox',
       telegramChatId: chatId,
       telegramMessageId: ctx.msg?.message_id,
-      assignees: isPrivate ? [createdBy] : undefined,
     });
     await logActivity(createdBy, cardId, 'telegram.today');
     const card = (await loadCard(cardId))!;
     broadcast({ type: 'card.created', card });
-    const routeKey = card.work_type === 'bug' ? 'bugs' : card.status;
     const groupConfigured = allowedGroupId() !== null;
-    const projected = !isPrivate && groupConfigured ? await projectCardToTopic(cardId) : false;
-    const routeLabel = ROUTE_LABEL[routeKey] ?? STATUS_LABEL[card.status];
-    await ctx.reply(isPrivate
-      ? `✅ «${card.title}» در کارهای شخصی شما ثبت شد.`
-      : !groupConfigured
-        ? '✅ کار ثبت شد؛ گروه تلگرام برای انتشار در تاپیک تنظیم نشده است.'
-        : projected
-          ? `✅ کار به تاپیک «${routeLabel}» اضافه شد.`
-          : `✅ کار ثبت شد؛ فرستادن آن به تاپیک «${routeLabel}» در صف است.`);
+    const projected = await projectCardToMirrors(cardId);
+    await ctx.reply(!groupConfigured
+      ? '✅ کار در SmartKanban ثبت شد؛ همگام‌سازی تلگرام تا زمان تنظیم گروه در صف می‌ماند.'
+      : projected
+        ? `✅ «${card.title}» در جریان مشترک تسک‌ها ثبت شد.`
+        : `✅ «${card.title}» ثبت شد؛ کارت‌های گروه و اعضا در صف همگام‌سازی هستند.`);
     return;
   }
 
@@ -1350,6 +1623,7 @@ async function handleText(
     broadcast({ type: 'card.created', card });
     // instantiateTemplate already logs a 'create' activity with template_id/template_name.
     // The source=telegram column on the card distinguishes this path; no extra log needed.
+    await projectCardToMirrors(card.id);
     await ctx.reply(`✅ «${escapeMd(card.title)}» در وضعیت «${STATUS_LABEL[card.status]}» ثبت شد.`, {
       parse_mode: 'Markdown',
       reply_markup: postSaveKeyboard(card.id, card.status),
@@ -1480,7 +1754,6 @@ async function sendMediaAttachmentChoice(ctx: Context, pending: PendingProposal)
   const message = pending.taskSourceMessageId !== undefined && !pending.isPrivateChat
     ? await ctx.api.sendMessage(pending.chatId, text, {
       reply_markup: replyMarkup,
-      ...(pending.taskSourceThreadId ? { message_thread_id: pending.taskSourceThreadId } : {}),
     })
     : await ctx.reply(text, { reply_markup: replyMarkup });
   updatePending(pending.id, { promptMessageId: message.message_id });
@@ -1605,8 +1878,6 @@ async function finalizeCard(
   status: Status,
 ): Promise<void> {
   const proposal = pending.proposal;
-  const isPrivate = pending.destination === 'private_card';
-  const assignees = isPrivate ? [pending.appUserId] : undefined;
   const cardId = await createCard({
     title: proposal.title || pending.original.slice(0, 80),
     description: proposal.description ?? '',
@@ -1619,7 +1890,6 @@ async function finalizeCard(
     status: status === 'in_progress' ? 'inbox' : status,
     workType: pending.taskWorkType ?? 'chore',
     aiSummarized: pending.aiSummarized ?? false,
-    assignees,
     telegramChatId: pending.chatId,
     telegramMessageId: pending.captureMessageId ?? pending.taskSourceMessageId ?? pending.promptMessageId ?? undefined,
   });
@@ -1645,36 +1915,25 @@ async function finalizeCard(
   if (card) {
     broadcast({ type: 'card.created', card });
   }
-  const routeKey = status === 'inbox' && pending.taskWorkType === 'bug' ? 'bugs' : status;
   const groupConfigured = allowedGroupId() !== null;
-  const shouldProject = !isPrivate && groupConfigured;
-  const projected = shouldProject ? await projectCardToTopic(cardId) : false;
+  const projected = await projectCardToMirrors(cardId);
 
   await logActivity(
     pending.appUserId,
     cardId,
     pending.taskSourceMessageId !== undefined
       ? 'telegram.task'
-      : isPrivate
-        ? 'telegram.text.private'
-        : 'telegram.text',
+      : 'telegram.text',
     taskContextDetails(pending),
   );
   deletePending(pending.id);
-  if (isPrivate) {
-    await ctx.reply(pending.isPrivateChat
-      ? `✅ کار «${proposal.title}» در کارهای شخصی شما ثبت شد.`
-      : '✅ کار خصوصی در کارهای شخصی شما ثبت شد.', {
-      reply_markup: pending.isPrivateChat ? postSaveKeyboard(cardId, status) : undefined,
-    });
-    return;
-  }
-  const routeLabel = ROUTE_LABEL[routeKey] ?? STATUS_LABEL[status];
   await ctx.reply(!groupConfigured
-    ? '✅ کار ثبت شد؛ گروه تلگرام برای انتشار در تاپیک تنظیم نشده است.'
+    ? `✅ «${proposal.title}» در SmartKanban ثبت شد؛ همگام‌سازی تلگرام تا زمان تنظیم گروه در صف می‌ماند.`
     : projected
-      ? `✅ کار به تاپیک «${routeLabel}» اضافه شد.`
-      : `✅ کار ثبت شد؛ فرستادن آن به تاپیک «${routeLabel}» در صف است.`);
+      ? `✅ «${proposal.title}» در جریان مشترک تسک‌ها ثبت شد.`
+      : `✅ «${proposal.title}» ثبت شد؛ کارت‌های گروه و اعضا در صف همگام‌سازی هستند.`, {
+      reply_markup: postSaveKeyboard(cardId, status),
+    });
 }
 
 function relativeAge(iso: string): string {
@@ -1703,19 +1962,8 @@ async function showAttachPicker(
     kItems = ks.map((k) => ({ id: k.id, label: `📚 ${k.title}` }));
   } else {
     const cs = await pool.query<{ id: string; title: string; status: Status }>(
-      `SELECT DISTINCT c.id, c.title, c.status
-       FROM cards c
-       LEFT JOIN card_assignees ca ON ca.card_id = c.id
-       LEFT JOIN card_shares cs ON cs.card_id = c.id
-       WHERE NOT c.archived
-         AND (
-           c.created_by = $1
-           OR ca.user_id = $1
-           OR cs.user_id = $1
-           OR NOT EXISTS (SELECT 1 FROM card_assignees ca2 WHERE ca2.card_id = c.id)
-         )
-       ORDER BY c.updated_at DESC LIMIT 5`,
-      [pending.appUserId],
+      `SELECT c.id, c.title, c.status FROM cards c
+       WHERE NOT c.archived ORDER BY c.updated_at DESC LIMIT 5`,
     );
     cardItems = cs.rows.map((c) => ({ id: c.id, label: `${STATUS_EMOJI[c.status]} ${c.title}` }));
     const ks = await pool.query<{ id: string; title: string }>(
@@ -1786,7 +2034,7 @@ async function attachToTarget(
   } else {
     // Knowledge items don't support binary attachments — fall back to new private card.
     await ctx.reply('فعلاً نمی‌توان فایل را به مورد دانش پیوست کرد؛ آن را به‌صورت یک کار جدید ثبت می‌کنم.');
-    updatePending(pending.id, { destination: 'private_card', attachMode: 'new' });
+    updatePending(pending.id, { destination: 'public_card', attachMode: 'new' });
     await finalizeCard(ctx, pending, 'inbox');
     return;
   }
@@ -1883,17 +2131,6 @@ async function handlePostSaveCallback(ctx: Context): Promise<boolean> {
   }
 
   const action = workflowMatch![1]!;
-  const targetStatus: Status = action === 'start' ? 'in_progress'
-    : action === 'test' ? 'ready_for_test'
-      : action === 'approve' ? 'ready_for_release' : 'needs_fix';
-  const currentCard = await loadCard(cardId);
-  if (currentCard && !(await hasTelegramWorkflowTopic(targetStatus, currentCard.work_type))) {
-    await ctx.answerCallbackQuery({
-      text: `ابتدا تاپیک «${STATUS_LABEL[targetStatus]}» را به بات وصل کن.`,
-      show_alert: true,
-    });
-    return true;
-  }
   const card = action === 'start'
     ? await transitionCard(cardId, appUserId, 'in_progress')
     : action === 'test'
@@ -1902,7 +2139,7 @@ async function handlePostSaveCallback(ctx: Context): Promise<boolean> {
   const newStatus = card.status;
   const badge = `${STATUS_EMOJI[newStatus]} ${STATUS_LABEL[newStatus]}`;
   broadcast({ type: 'card.updated', card });
-  await projectCardToTopic(card.id);
+  await projectCardToMirrors(card.id);
   try {
     const current = ctx.callbackQuery!.message?.text ?? '';
     const text = `✅ به «${STATUS_LABEL[newStatus]}» منتقل شد.\n\n${current}`;
@@ -2082,16 +2319,7 @@ async function showLinkPicker(
     cards = hits.map((h) => ({ id: h.id, title: h.title }));
   } else {
     const { rows } = await pool.query<{ id: string; title: string }>(
-      `SELECT DISTINCT c.id, c.title
-       FROM cards c
-       LEFT JOIN card_assignees ca ON ca.card_id = c.id
-       LEFT JOIN card_shares cs ON cs.card_id = c.id
-       WHERE NOT c.archived
-         AND (c.created_by = $1 OR ca.user_id = $1 OR cs.user_id = $1
-              OR NOT EXISTS (SELECT 1 FROM card_assignees ca2 WHERE ca2.card_id = c.id))
-       ORDER BY c.updated_at DESC
-       LIMIT 5`,
-      [userId],
+      `SELECT id, title FROM cards WHERE NOT archived ORDER BY updated_at DESC LIMIT 5`,
     );
     cards = rows;
   }
@@ -2115,7 +2343,7 @@ async function finalizeCardWithLink(
 ): Promise<void> {
   const status: Status = 'inbox';
   if (pending.destination === 'knowledge') {
-    await ctx.reply('پیوند فقط برای مقصدهای کار در دسترس است. ابتدا «شخصی» یا «گروه» را انتخاب کن.');
+    await ctx.reply('پیوند فقط برای تسک‌ها در دسترس است. «جریان مشترک تسک‌ها» را انتخاب کن.');
     deletePending(pending.id);
     return;
   }
@@ -2124,12 +2352,6 @@ async function finalizeCardWithLink(
     deletePending(pending.id);
     return;
   }
-  if (pending.destination !== 'private_card' && allowedGroupId() !== null &&
-      !(await hasTelegramWorkflowTopic(status, pending.taskWorkType ?? 'chore'))) {
-    await ctx.reply(`ابتدا تاپیک «${pending.taskWorkType === 'bug' ? ROUTE_LABEL.bugs : STATUS_LABEL[status]}» را به بات وصل کن.`);
-    return;
-  }
-
   const cardId = await createCard({
     title: pending.proposal.title || pending.original.slice(0, 80),
     description: pending.proposal.description ?? '',
@@ -2139,7 +2361,6 @@ async function finalizeCardWithLink(
     status,
     workType: pending.taskWorkType ?? 'chore',
     aiSummarized: true,
-    assignees: pending.destination === 'private_card' ? [pending.appUserId] : undefined,
     telegramChatId: pending.chatId,
     telegramMessageId: pending.promptMessageId ?? undefined,
   });
@@ -2172,24 +2393,15 @@ async function finalizeCardWithLink(
   if (card) {
     broadcast({ type: 'card.created', card });
   }
-  const routeKey = pending.taskWorkType === 'bug' ? 'bugs' : status;
-  const isPrivate = pending.destination === 'private_card';
   const groupConfigured = allowedGroupId() !== null;
-  const projected = !isPrivate && groupConfigured ? await projectCardToTopic(cardId) : false;
-  if (isPrivate) {
-    await ctx.reply(
-      pending.isPrivateChat
-        ? `✅ کار «${pending.proposal.title}» در کارهای شخصی ثبت شد.\n🔗 ${linkLabelText(pending.pendingLinkLabel)} «${target?.title ?? 'نامشخص'}»${noteLine}`
-        : '✅ کار خصوصی در کارهای شخصی شما ثبت شد.',
-      { reply_markup: card && pending.isPrivateChat ? postSaveKeyboard(cardId, status) : undefined },
-    );
-  } else {
-    await ctx.reply(!groupConfigured
-      ? '✅ کار ثبت شد؛ گروه تلگرام برای انتشار در تاپیک تنظیم نشده است.'
-      : projected
-        ? `✅ کار به تاپیک «${ROUTE_LABEL[routeKey]}» اضافه شد و به مورد انتخابی پیوند خورد.`
-        : `✅ کار ثبت شد؛ فرستادن آن به تاپیک «${ROUTE_LABEL[routeKey]}» در صف است.`);
-  }
+  const projected = await projectCardToMirrors(cardId);
+  await ctx.reply(!groupConfigured
+    ? `✅ «${pending.proposal.title}» ثبت شد و به «${target?.title ?? 'نامشخص'}» پیوند خورد؛ همگام‌سازی تلگرام در صف است.`
+    : projected
+      ? `✅ «${pending.proposal.title}» به «${target?.title ?? 'نامشخص'}» پیوند خورد و در جریان مشترک منتشر شد.${noteLine}`
+      : `✅ کار ثبت شد و پیوند خورد؛ کارت‌های گروه و اعضا در صف همگام‌سازی هستند.${noteLine}`, {
+      reply_markup: card ? postSaveKeyboard(cardId, status) : undefined,
+    });
 }
 
 export function buildBot(token: string): Bot {
@@ -2205,6 +2417,39 @@ export function buildBot(token: string): Bot {
       return;
     }
     return next();
+  });
+
+  bot.callbackQuery(/^taskdraft:(confirm|cancel):([A-Za-z0-9_-]+)$/, async (ctx) => {
+    const [, action, id] = ctx.match!;
+    const pending = pendingTaskActions.get(id!);
+    if (!pending || Date.now() - pending.createdAt > TASK_ACTION_TTL_MS) {
+      pendingTaskActions.delete(id!);
+      await ctx.answerCallbackQuery({ text: 'مهلت این پیش‌نمایش تمام شده است.', show_alert: true });
+      return;
+    }
+    if (ctx.from.id !== pending.telegramUserId || ctx.chat?.id !== pending.chatId) {
+      await ctx.answerCallbackQuery({ text: 'این پیش‌نمایش برای فرستندهٔ درخواست است.' });
+      return;
+    }
+    if (action === 'cancel') {
+      pendingTaskActions.delete(id!);
+      try { await ctx.editMessageText('❌ ساخت کار لغو شد.', { reply_markup: undefined }); } catch {}
+      await ctx.answerCallbackQuery({ text: 'لغو شد.' });
+      return;
+    }
+    pendingTaskActions.delete(id!);
+    await ctx.answerCallbackQuery({ text: 'در حال ساخت…' });
+    try {
+      await createDraftTasks(pending);
+      try {
+        await ctx.editMessageText(`✅ ${pending.tasks.length} کار ${pending.parentCardId ? 'جداگانهٔ پیوندخورده' : 'جداگانه'} ساخته شد.`, {
+          reply_markup: undefined,
+        });
+      } catch {}
+    } catch (error) {
+      console.error('[telegram] confirmed task creation failed:', error);
+      await ctx.reply('ساخت کارها کامل نشد. بخشی از موارد ممکن است ساخته شده باشد؛ پیش از تأیید دوباره، تخته را بررسی کن.');
+    }
   });
 
   bot.callbackQuery(/^kshow:/, async (ctx) => {
@@ -2292,9 +2537,7 @@ export function buildBot(token: string): Bot {
     }
     pendingTagTargets.set(ctx.from.id, { kind: 'card', id, chatId: ctx.chat?.id, createdAt: Date.now() });
     await ctx.answerCallbackQuery({ text: 'حالا دستور /tag را همراه برچسب‌ها بفرست.' });
-    const message = ctx.callbackQuery.message;
-    const threadId = message && 'message_thread_id' in message ? message.message_thread_id : undefined;
-    await sendToChatTopic(ctx.chat?.id, threadId, `برای افزودن برچسب به «${card.title}»، همین‌جا بنویس: /tag فوری، رابط کاربری`);
+    await sendToChat(ctx.chat?.id, `برای افزودن برچسب به «${card.title}»، همین‌جا بنویس: /tag فوری، رابط کاربری`);
   });
 
   bot.callbackQuery(/^ktag:/, async (ctx) => {
@@ -2311,9 +2554,7 @@ export function buildBot(token: string): Bot {
     }
     pendingTagTargets.set(ctx.from.id, { kind: 'knowledge', id, chatId: ctx.chat?.id, createdAt: Date.now() });
     await ctx.answerCallbackQuery({ text: 'حالا دستور /tag را همراه برچسب‌ها بفرست.' });
-    const message = ctx.callbackQuery.message;
-    const threadId = message && 'message_thread_id' in message ? message.message_thread_id : undefined;
-    await sendToChatTopic(ctx.chat?.id, threadId, `برای افزودن برچسب به «${item.title}»، همین‌جا بنویس: /tag مرجع، مطالعه`);
+    await sendToChat(ctx.chat?.id, `برای افزودن برچسب به «${item.title}»، همین‌جا بنویس: /tag مرجع، مطالعه`);
   });
 
   // ---------- structured-capture callbacks ----------
@@ -2349,7 +2590,6 @@ export function buildBot(token: string): Bot {
       const prompt = 'به این پیام پاسخ بده و عنوان و جزئیات کار را بنویس. آن را بدون هوش مصنوعی ذخیره می‌کنم.';
       const message = pending.taskSourceMessageId !== undefined && !pending.isPrivateChat
         ? await ctx.api.sendMessage(pending.chatId, prompt, {
-          ...(pending.taskSourceThreadId ? { message_thread_id: pending.taskSourceThreadId } : {}),
         })
         : await ctx.reply(prompt);
       updatePending(pending.id, { promptMessageId: message.message_id });
@@ -2452,7 +2692,7 @@ export function buildBot(token: string): Bot {
     await ctx.answerCallbackQuery({ text: 'لغو شد.' });
   });
 
-  bot.callbackQuery(/^dest:(private_card|public_card|knowledge):([^:]+)$/, async (ctx) => {
+  bot.callbackQuery(/^dest:(public_card|knowledge):([^:]+)$/, async (ctx) => {
     const dest = ctx.match![1] as Destination;
     const pid = ctx.match![2]!;
     const pending = getPending(pid);
@@ -2466,14 +2706,9 @@ export function buildBot(token: string): Bot {
       await finalizeKnowledge(ctx, pending);
       return;
     }
-    if (dest === 'private_card') {
-      try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch {}
-      await finalizeCard(ctx, pending, 'inbox');
-      return;
-    }
     try {
       await ctx.editMessageReplyMarkup({ reply_markup: columnKeyboard(pid) });
-      await ctx.reply('این کار در کدام تاپیک باشد؟');
+      await ctx.reply('این کار از کدام وضعیت شروع شود؟');
     } catch { /* edit non-fatal */ }
   });
 
@@ -2483,14 +2718,6 @@ export function buildBot(token: string): Bot {
     const pending = getPending(pid);
     if (!pending) {
       await ctx.answerCallbackQuery({ text: 'مهلت این درخواست تمام شده است.', show_alert: true });
-      return;
-    }
-    const workType = pending.taskWorkType ?? 'chore';
-    if (!(await hasTelegramWorkflowTopic(status, workType))) {
-      await ctx.answerCallbackQuery({
-        text: `تاپیک «${STATUS_LABEL[status]}» هنوز به بات وصل نشده است.`,
-        show_alert: true,
-      });
       return;
     }
     await ctx.answerCallbackQuery();
@@ -2809,7 +3036,7 @@ export function buildBot(token: string): Bot {
     const isPrivateChat = chatType === 'private';
     // Accept: (a) messages in the configured family group, or
     //         (b) DMs from any registered telegram_identity (private capture).
-    if (!isPrivateChat && allowed !== null && chatId !== allowed) {
+    if (!isPrivateChat && (allowed === null || chatId !== allowed)) {
       return; // silent ignore outside family group
     }
 
@@ -2828,13 +3055,20 @@ export function buildBot(token: string): Bot {
         pending.attachMode === 'pickRecent' || pending.attachMode === 'pickFiltered'
       ),
     );
-    if (!isPrivateChat && !mentionsBot && !command && !explicitPendingReply) return;
+    const taskReply = Boolean(await cardForReply(chatId, replyId));
+    if (!isPrivateChat && !mentionsBot && !command && !explicitPendingReply && !taskReply) return;
     if (text && mentionPattern) text = text.replace(mentionPattern, '').trim();
 
     const tgUser = ctx.from;
     if (!tgUser) return;
     const appUserId = await resolveAppUser(tgUser.id, tgUser.username);
-    if (!appUserId) return; // unknown sender: silent ignore
+    if (!appUserId) {
+      if (isPrivateChat && command === 'start') {
+        const link = telegramBotStartUrl();
+        await ctx.reply(`برای دریافت آینهٔ تسک‌ها در گفت‌وگوی خصوصی، ابتدا شناسهٔ تلگرامت را در تنظیمات SmartKanban پیوند بده و بعد /start را بفرست.${link ? `\n\nپیوند بات: ${link}` : ''}`);
+      }
+      return;
+    }
 
     try {
       if (ctx.msg?.voice || ctx.msg?.audio) {
@@ -2848,7 +3082,7 @@ export function buildBot(token: string): Bot {
       // Never drop user input silently: save a card with raw body if possible.
       const raw = ctx.msg?.text ?? ctx.msg?.caption ?? '[پیام تلگرام — خطای پردازش]';
       const failedCommand = parseCommand(raw).command;
-      if (failedCommand === 'task' || failedCommand === 'remember' || failedCommand === 'forget') {
+      if (taskReply || failedCommand) {
         console.error('[telegram] command failed; not creating a fallback card:', e);
         await ctx.reply('دستور اجرا نشد. اگر /task بود، پیش از تلاش دوباره تخته را بررسی کن.');
         return;
@@ -2868,14 +3102,10 @@ export function buildBot(token: string): Bot {
       const card = (await loadCard(cardId))!;
       broadcast({ type: 'card.created', card });
       const groupConfigured = allowedGroupId() !== null;
-      const projected = !isPrivateChat && groupConfigured ? await projectCardToTopic(cardId) : false;
-      await ctx.reply(isPrivateChat
-        ? `کار «${card.title}» ذخیره شد و برای بازبینی علامت خورد.`
-        : !groupConfigured
-          ? 'کار ذخیره شد؛ گروه تلگرام برای انتشار در تاپیک تنظیم نشده است.'
-          : projected
-            ? `کار برای بازبینی در تاپیک «${STATUS_LABEL[card.status]}» ثبت شد.`
-            : `کار برای بازبینی ثبت شد؛ فرستادن آن به تاپیک «${STATUS_LABEL[card.status]}» در صف است.`);
+      await projectCardToMirrors(cardId);
+      await ctx.reply(!groupConfigured
+        ? `کار «${card.title}» ذخیره شد و برای بازبینی علامت خورد؛ همگام‌سازی تلگرام در صف است.`
+        : `کار «${card.title}» ذخیره شد و برای بازبینی در جریان مشترک قرار گرفت.`);
     }
     return next();
   });
@@ -2899,6 +3129,7 @@ export async function startTelegramBot(): Promise<void> {
   // Resolve the bot username before webhook updates arrive so direct mentions
   // can be distinguished from ordinary group messages.
   await botInstance.init();
+  await queueMissingGroupMirrors();
   if (!projectionTimer) {
     projectionTimer = setInterval(() => {
       flushProjectionOutbox().catch((error) => console.error('[telegram] projection retry failed:', error));

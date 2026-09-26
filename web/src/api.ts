@@ -70,6 +70,7 @@ export const api = {
     req<Array<{ telegram_user_id: number; app_user_id: string; telegram_username: string | null }>>(
       '/api/telegram/identities',
     ),
+  telegramConfig: () => req<{ bot_start_url: string | null }>('/api/telegram/config'),
   unlinkTelegram: (id: number) =>
     req<void>(`/api/telegram/identities/${id}`, { method: 'DELETE' }),
 

@@ -28,20 +28,15 @@ test('defaultDestination: knowledge when extra text contains URL (raw message)',
   );
 });
 
-test('defaultDestination: private_card in DM with no URL', () => {
-  assert.equal(defaultDestination(baseProposal, true), 'private_card');
+test('defaultDestination: DM tasks join the shared stream', () => {
+  assert.equal(defaultDestination(baseProposal, true), 'public_card');
 });
 
 test('defaultDestination: public_card in group with no URL', () => {
   assert.equal(defaultDestination(baseProposal, false), 'public_card');
 });
 
-test('destinationOptions DM order: private, public, knowledge', () => {
+test('destinationOptions never offers a private task destination', () => {
   const opts = destinationOptions(true);
-  assert.deepEqual(opts.map((o) => o.key), ['private_card', 'public_card', 'knowledge']);
-});
-
-test('destinationOptions group order: public, private, knowledge', () => {
-  const opts = destinationOptions(false);
-  assert.deepEqual(opts.map((o) => o.key), ['public_card', 'private_card', 'knowledge']);
+  assert.deepEqual(opts.map((o) => o.key), ['public_card', 'knowledge']);
 });

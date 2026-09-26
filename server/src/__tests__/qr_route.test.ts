@@ -71,7 +71,7 @@ test('GET /api/cards/:id/qr.svg: 200 with SVG content for own card', async () =>
   assert.match(res.body, /<svg/);
 });
 
-test('GET /api/cards/:id/qr.svg: 404 when card not visible', async () => {
+test('GET /api/cards/:id/qr.svg: authenticated teammate can open a team card', async () => {
   const cardId = await createCard(cookieA, 'private');
   await app.inject({
     method: 'PATCH',
@@ -84,7 +84,7 @@ test('GET /api/cards/:id/qr.svg: 404 when card not visible', async () => {
     url: `/api/cards/${cardId}/qr.svg`,
     headers: { cookie: cookieB },
   });
-  assert.equal(res.statusCode, 404);
+  assert.equal(res.statusCode, 200);
 });
 
 test('GET /api/cards/:id/qr.svg: 401 when unauthenticated', async () => {

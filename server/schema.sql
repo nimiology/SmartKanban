@@ -157,30 +157,43 @@ CREATE INDEX IF NOT EXISTS telegram_context_messages_fts_idx
 CREATE INDEX IF NOT EXISTS telegram_context_messages_expiry_idx
   ON telegram_context_messages (expires_at);
 
-CREATE TABLE IF NOT EXISTS telegram_workflow_topics (
-  group_chat_id BIGINT NOT NULL,
-  route_key TEXT NOT NULL CHECK (route_key IN (
-    'inbox','in_progress','ready_for_test','needs_fix','ready_for_release','released','bugs'
-  )),
-  thread_id BIGINT NOT NULL,
-  bound_by UUID REFERENCES users(id) ON DELETE SET NULL,
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  PRIMARY KEY (group_chat_id, route_key),
-  UNIQUE (group_chat_id, thread_id)
-);
-
 CREATE TABLE IF NOT EXISTS telegram_task_messages (
   id BIGSERIAL PRIMARY KEY,
   card_id UUID NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
   chat_id BIGINT NOT NULL,
   thread_id BIGINT NOT NULL DEFAULT 0,
+  recipient_telegram_user_id BIGINT,
+  part_index INTEGER NOT NULL DEFAULT 0,
+  projected_hash TEXT,
+  projected_status TEXT,
+  projected_owner_user_id UUID,
+  projected_tester_user_id UUID,
+  notified_status TEXT,
   message_id BIGINT NOT NULL,
   is_current BOOLEAN NOT NULL DEFAULT TRUE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE (chat_id, thread_id, message_id)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS telegram_task_messages_current_idx
-  ON telegram_task_messages(card_id) WHERE is_current;
+ALTER TABLE telegram_task_messages
+  ADD COLUMN IF NOT EXISTS recipient_telegram_user_id BIGINT,
+  ADD COLUMN IF NOT EXISTS part_index INTEGER NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS projected_hash TEXT,
+  ADD COLUMN IF NOT EXISTS projected_status TEXT,
+  ADD COLUMN IF NOT EXISTS projected_owner_user_id UUID,
+  ADD COLUMN IF NOT EXISTS projected_tester_user_id UUID,
+  ADD COLUMN IF NOT EXISTS notified_status TEXT;
+DROP INDEX IF EXISTS telegram_task_messages_current_idx;
+DO $$ BEGIN
+  IF to_regclass('telegram_workflow_topics') IS NOT NULL THEN
+    UPDATE telegram_task_messages SET is_current = FALSE WHERE is_current;
+  END IF;
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS telegram_task_messages_current_group_idx
+  ON telegram_task_messages(card_id, part_index)
+  WHERE is_current AND recipient_telegram_user_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS telegram_task_messages_current_dm_idx
+  ON telegram_task_messages(card_id, recipient_telegram_user_id, part_index)
+  WHERE is_current AND recipient_telegram_user_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS telegram_projection_outbox (
   card_id UUID PRIMARY KEY REFERENCES cards(id) ON DELETE CASCADE,
@@ -189,6 +202,22 @@ CREATE TABLE IF NOT EXISTS telegram_projection_outbox (
   last_error TEXT NOT NULL DEFAULT '',
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+DROP TABLE IF EXISTS telegram_workflow_topics;
+CREATE OR REPLACE FUNCTION enqueue_telegram_card_projection() RETURNS trigger AS $$
+BEGIN
+  INSERT INTO telegram_projection_outbox (card_id)
+  VALUES (NEW.id)
+  ON CONFLICT (card_id) DO UPDATE SET next_attempt_at = NOW(), updated_at = NOW();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS cards_telegram_projection_outbox ON cards;
+CREATE TRIGGER cards_telegram_projection_outbox
+AFTER INSERT OR UPDATE OF title, description, status, tags, archived, owner_user_id,
+  tester_user_id, work_type, priority, acceptance_criteria, due_date,
+  branch_url, pull_request_url, peer_test_notes
+ON cards FOR EACH ROW EXECUTE FUNCTION enqueue_telegram_card_projection();
 
 CREATE TABLE IF NOT EXISTS workflow_releases (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

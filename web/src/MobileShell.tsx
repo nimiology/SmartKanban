@@ -79,7 +79,7 @@ function relTime(iso: string): string {
 
 export function MobileShell({ meId }: { meId: string }) {
   const [tab, setTab] = useState<Tab>('board');
-  const [scope, setScope] = useState<Scope>('personal');
+  const [scope, setScope] = useState<Scope>('all');
   const [activeStatus, setActiveStatus] = useState<Status>('inbox');
   const [cards, setCards] = useState<Card[]>([]);
   const [users, setUsers] = useState<User[]>([]);
@@ -148,7 +148,7 @@ export function MobileShell({ meId }: { meId: string }) {
         const isMine = incoming.created_by === meId || incoming.assignees.includes(meId) || incoming.shares.includes(meId);
         const isInbox = incoming.assignees.length === 0;
         const isSharedWithMe = incoming.shares.includes(meId) && incoming.created_by !== meId;
-        const visible = scope === 'inbox' ? isInbox : scope === 'personal' ? isMine : scope === 'shared' ? isSharedWithMe : isMine || isInbox;
+        const visible = scope === 'inbox' ? isInbox : scope === 'personal' ? isMine : scope === 'shared' ? isSharedWithMe : true;
         setCards((prev) => {
           const without = prev.filter((c) => c.id !== incoming.id);
           return visible ? [...without, incoming] : without;

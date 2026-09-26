@@ -95,7 +95,7 @@ function AuthedWithToast({ meId }: { meId: string }) {
 function Authed({ meId }: { meId: string }) {
   const [cards, setCards] = useState<Card[]>([]);
   const [users, setUsers] = useState<User[]>([]);
-  const [scope, setScope] = useState<Scope>('personal');
+  const [scope, setScope] = useState<Scope>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [editing, setEditing] = useState<Card | null>(null);
   const [captureOpen, setCaptureOpen] = useState(false);
@@ -219,10 +219,8 @@ function Authed({ meId }: { meId: string }) {
           incoming.shares.includes(meId);
         const isInbox = incoming.assignees.length === 0;
         const isSharedWithMe = incoming.shares.includes(meId) && incoming.created_by !== meId;
-        // Match the server's per-scope visibility rules so broadcasts don't
-        // leak cards that belong to a different user's private channel.
         const visible =
-          scope === 'inbox' ? isInbox : scope === 'personal' ? isMine : scope === 'shared' ? isSharedWithMe : isMine || isInbox;
+          scope === 'inbox' ? isInbox : scope === 'personal' ? isMine : scope === 'shared' ? isSharedWithMe : true;
         setCards((prev) => {
           const without = prev.filter((c) => c.id !== incoming.id);
           return visible ? [...without, incoming] : without;

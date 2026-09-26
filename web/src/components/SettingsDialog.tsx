@@ -27,6 +27,7 @@ export function SettingsDialog({ onClose }: Props) {
   const [identities, setIdentities] = useState<
     Array<{ telegram_user_id: number; app_user_id: string; telegram_username: string | null }>
   >([]);
+  const [telegramBotUrl, setTelegramBotUrl] = useState<string | null>(null);
   const [tgId, setTgId] = useState('');
   const [tgUser, setTgUser] = useState('');
   const [newLabel, setNewLabel] = useState('mirror');
@@ -40,6 +41,7 @@ export function SettingsDialog({ onClose }: Props) {
     setTokens(await api.mirrorTokens());
     setApiTokens(await api.apiTokens());
     setIdentities(await api.listTelegramIdentities());
+    setTelegramBotUrl((await api.telegramConfig()).bot_start_url);
   };
 
   useEffect(() => {
@@ -267,9 +269,14 @@ export function SettingsDialog({ onClose }: Props) {
           <section className="flex flex-col gap-3">
             <h3 className="text-3 font-semibold text-ink tracking-tight2">Telegram identities</h3>
             <p className="text-1 tracking-tight2 text-ink-soft">
-              Link Telegram user IDs to family members so the bot knows who's captured what. Get your
-              ID from <code>@userinfobot</code>.
+              Start the bot once so it can send you task mirrors in Telegram, then link your Telegram user ID here.
+              Get your ID from <code>@userinfobot</code>.
             </p>
+            {telegramBotUrl && (
+              <a href={telegramBotUrl} target="_blank" rel="noreferrer" className="text-1 text-green-starbucks underline">
+                Open the SmartKanban Telegram bot
+              </a>
+            )}
             <div className="flex gap-2">
               <input
                 value={tgId}

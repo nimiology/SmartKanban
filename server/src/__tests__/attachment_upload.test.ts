@@ -107,9 +107,9 @@ test('POST /api/cards/:id/attachments: 201 attaches image to card', async () => 
   assert.ok(stat.size > 0);
 });
 
-test('POST /api/cards/:id/attachments: 404 when card not visible', async () => {
+test('POST /api/cards/:id/attachments: team member can attach to a team card', async () => {
   const cardId = await createCard(cookieA, 'private');
-  // userA's card is private to A. Set assignees to only A so B cannot see it.
+  // Assignment filters the personal view; it does not hide a task from the team.
   await app.inject({
     method: 'PATCH',
     url: `/api/cards/${cardId}`,
@@ -123,7 +123,7 @@ test('POST /api/cards/:id/attachments: 404 when card not visible', async () => {
     headers: { ...headers, cookie: cookieB },
     payload: body,
   });
-  assert.equal(res.statusCode, 404);
+  assert.equal(res.statusCode, 201);
 });
 
 test('POST /api/cards/:id/attachments: 415 on bad MIME', async () => {
