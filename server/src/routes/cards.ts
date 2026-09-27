@@ -113,7 +113,6 @@ export async function cardRoutes(app: FastifyInstance) {
     const userId = req.user!.id;
     const ownerId = owner_user_id ?? assignees?.[0] ?? userId;
     const actualAssignees = Array.from(new Set([...(assignees ?? []), ownerId]));
-    if (tester_user_id && tester_user_id === ownerId) return reply.code(400).send({ error: 'tester must differ from owner' });
 
     const { rows } = await pool.query<{ id: string }>(
       `INSERT INTO cards
@@ -173,11 +172,6 @@ export async function cardRoutes(app: FastifyInstance) {
     if (!existing) return reply.code(404).send({ error: 'not found' });
     if (!(await canUserSeeCard(req.user!.id, id))) {
       return reply.code(404).send({ error: 'not found' });
-    }
-    const nextOwnerId = body.owner_user_id ?? existing.owner_user_id;
-    const nextTesterId = body.tester_user_id === undefined ? existing.tester_user_id : body.tester_user_id;
-    if (nextOwnerId && nextTesterId && nextOwnerId === nextTesterId) {
-      return reply.code(400).send({ error: 'tester must differ from owner' });
     }
 
     const sets: string[] = [];

@@ -93,8 +93,8 @@ The bot publishes an editable task card with quick-action buttons:
 
 Workflow buttons use the same server-side transition rules as the board. Tasks
 move through Inbox → In Progress → Ready for Test → Ready for Release →
-Released / Done, with Needs Fix returning to In Progress. The assigned tester
-must differ from the owner and records the pass/fail result.
+Released / Done, with Needs Fix returning to In Progress. A separate tester is
+optional; when none is assigned, the owner records the pass/fail result.
 
 ### Telegram task stream
 
@@ -666,8 +666,8 @@ Per-client visibility filter applies to all `template.*` and
 | `/task [prompt]` | group reply | Create from replied-to text, photo, or audio + explicitly remembered context |
 | `/start`         | task reply | Inbox → In Progress (owner); in DM, queue active task mirrors |
 | `/test`          | task reply | In Progress → Ready for Test (owner)                        |
-| `/approve`       | task reply | Pass peer test (assigned tester)                            |
-| `/fail [notes]`  | task reply | Fail peer test (assigned tester)                            |
+| `/approve`       | task reply | Pass test (assigned tester, or owner if none is assigned)   |
+| `/fail [notes]`  | task reply | Fail test (assigned tester, or owner if none is assigned)   |
 | `/release …`     | group      | Record staging result for a version + commit SHA (admin)    |
 | `/done …`        | group      | Record production smoke result and close release (admin)    |
 | `/assign @user`  | reply      | Reassign card                                               |

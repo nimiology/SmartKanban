@@ -61,15 +61,13 @@ export async function transitionCard(
     }
     if (to === 'ready_for_test') {
       if (actorId !== card.owner_user_id) throw new WorkflowError('Only the task owner can submit it for testing.', 'forbidden');
-      if (!card.owner_user_id || !card.tester_user_id || card.owner_user_id === card.tester_user_id) {
-        throw new WorkflowError('Assign one owner and a different tester before testing.', 'missing_tester');
-      }
     }
+    const testActorId = card.tester_user_id ?? card.owner_user_id;
     if (to === 'needs_fix') {
-      if (actorId !== card.tester_user_id && !card.is_admin) throw new WorkflowError('Only the assigned tester can fail this test.', 'forbidden');
+      if (actorId !== testActorId && !card.is_admin) throw new WorkflowError('Only the task tester can fail this test.', 'forbidden');
     }
     if (to === 'ready_for_release') {
-      if (actorId !== card.tester_user_id) throw new WorkflowError('Only the assigned tester can approve the test.', 'forbidden');
+      if (actorId !== testActorId) throw new WorkflowError('Only the task tester can approve the test.', 'forbidden');
       if (card.peer_test_result !== 'passed' && peerTest?.passed !== true) throw new WorkflowError('Record a passing peer test first.', 'test_required');
     }
     if (to === 'in_progress' && card.status === 'needs_fix' && actorId !== card.owner_user_id && !card.is_admin) {

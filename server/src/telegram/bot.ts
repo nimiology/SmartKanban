@@ -125,9 +125,8 @@ function workflowErrorText(error: unknown): string {
     'Task not found or unavailable.': 'این کار پیدا نشد یا در دسترس نیست.',
     'Only the task owner can start it.': 'فقط مسئول کار می‌تواند آن را شروع کند.',
     'Only the task owner can submit it for testing.': 'فقط مسئول کار می‌تواند آن را برای آزمایش بفرستد.',
-    'Assign one owner and a different tester before testing.': 'پیش از آزمایش، یک مسئول و یک آزمایش‌گر متفاوت تعیین کن.',
-    'Only the assigned tester can fail this test.': 'فقط آزمایش‌گر تعیین‌شده می‌تواند این آزمایش را رد کند.',
-    'Only the assigned tester can approve the test.': 'فقط آزمایش‌گر تعیین‌شده می‌تواند آزمایش را تأیید کند.',
+    'Only the task tester can fail this test.': 'فقط آزمایش‌گر کار می‌تواند این آزمایش را رد کند.',
+    'Only the task tester can approve the test.': 'فقط آزمایش‌گر کار می‌تواند آزمایش را تأیید کند.',
     'Record a passing peer test first.': 'ابتدا نتیجهٔ موفق آزمایش همتا را ثبت کن.',
     'Only the task owner can resume a failed task.': 'فقط مسئول کار می‌تواند کار ردشده را از سر بگیرد.',
     'Only a release manager can close a release task.': 'فقط مدیر انتشار می‌تواند کار انتشار را ببندد.',
@@ -575,7 +574,7 @@ function recipientNeedsAction(
   appUserId: string | null,
   isAdmin: boolean,
 ): boolean {
-  return (card.status === 'ready_for_test' && Boolean(appUserId && card.tester_user_id === appUserId)) ||
+  return (card.status === 'ready_for_test' && Boolean(appUserId && (card.tester_user_id ?? card.owner_user_id) === appUserId)) ||
     (card.status === 'needs_fix' && Boolean(appUserId && card.owner_user_id === appUserId)) ||
     (card.status === 'ready_for_release' && isAdmin);
 }
@@ -644,15 +643,12 @@ async function setTaskOwner(cardId: string, actorId: string, ownerId: string): P
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const { rows } = await client.query<{ tester_user_id: string | null }>(
-      `SELECT tester_user_id::text FROM cards WHERE id = $1 AND NOT archived FOR UPDATE`,
+    const { rows } = await client.query<{ id: string }>(
+      `SELECT id FROM cards WHERE id = $1 AND NOT archived FOR UPDATE`,
       [cardId],
     );
     const card = rows[0];
     if (!card) throw new WorkflowError('Task not found or unavailable.', 'not_found');
-    if (card.tester_user_id === ownerId) {
-      throw new WorkflowError('Owner and tester must be different.', 'invalid_assignment');
-    }
     await client.query(`UPDATE cards SET owner_user_id = $2, updated_at = NOW() WHERE id = $1`, [cardId, ownerId]);
     await client.query(`DELETE FROM card_assignees WHERE card_id = $1`, [cardId]);
     await client.query(`INSERT INTO card_assignees (card_id, user_id) VALUES ($1, $2)`, [cardId, ownerId]);
@@ -1147,9 +1143,7 @@ async function handleText(
         await projectCardToMirrors(updated.id);
         await ctx.reply(`👤 مسئول «${updated.title}» به ${matches[0]!.name} تغییر کرد.`);
       } catch (error) {
-        await ctx.reply(error instanceof WorkflowError && error.code === 'invalid_assignment'
-          ? 'مسئول و آزمایش‌گر باید دو عضو متفاوت باشند.'
-          : workflowErrorText(error));
+        await ctx.reply(workflowErrorText(error));
       }
       return;
     }
@@ -1534,9 +1528,7 @@ async function handleText(
         await projectCardToMirrors(referencedCardId);
         await reactOk(ctx);
       } catch (error) {
-        await ctx.reply(error instanceof WorkflowError && error.code === 'invalid_assignment'
-          ? 'مسئول و آزمایش‌گر باید دو عضو متفاوت باشند.'
-          : workflowErrorText(error));
+        await ctx.reply(workflowErrorText(error));
       }
     } else {
       await reactOk(ctx, '🤔');

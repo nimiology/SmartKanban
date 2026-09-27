@@ -460,10 +460,10 @@ export function EditDialog({ card, users, meId, incomingChatEvents, onSave, onCl
                   {users.map((u) => <option key={u.id} value={u.id}>{u.short_name || u.name}</option>)}
                 </select>
               </label>
-              <label className="text-1 text-ink-soft">Peer tester
+              <label className="text-1 text-ink-soft">Tester (optional)
                 <select className="mt-1 w-full rounded-lg border border-ink/10 bg-card px-2 py-2 text-2 text-ink" value={testerId} onChange={(e) => setTesterId(e.target.value)}>
-                  <option value="">Choose a different teammate</option>
-                  {users.filter((u) => u.id !== ownerId).map((u) => <option key={u.id} value={u.id}>{u.short_name || u.name}</option>)}
+                  <option value="">Owner tests this task</option>
+                  {users.map((u) => <option key={u.id} value={u.id}>{u.short_name || u.name}</option>)}
                 </select>
               </label>
               <label className="text-1 text-ink-soft">Type
