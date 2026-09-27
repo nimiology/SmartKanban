@@ -72,8 +72,9 @@ CREATE TABLE IF NOT EXISTS telegram_task_messages (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE (chat_id, thread_id, message_id)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS telegram_task_messages_current_idx
-  ON telegram_task_messages(card_id) WHERE is_current;
+-- Current Telegram projections are scoped by group/DM and indexed in
+-- 2026-09-26-telegram-flat-projections.sql. Do not recreate the superseded
+-- card-only index here: deploy-server.sh replays this historical migration.
 
 CREATE TABLE IF NOT EXISTS telegram_projection_outbox (
   card_id UUID PRIMARY KEY REFERENCES cards(id) ON DELETE CASCADE,
